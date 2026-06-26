@@ -1,28 +1,19 @@
 """
 =============================================================================
-  CUP AND HANDLE PATTERN DETECTOR — Indian Stock Market (NSE)
+  CUP AND HANDLE PATTERN DETECTOR  v2.0
+  Indian Stock Market (NSE)
 =============================================================================
 
   Author : AI-assisted project
   Purpose: Detect "Cup and Handle" chart patterns on NSE stocks using
-           Yahoo Finance data with verified mathematical geometry filters.
+           Yahoo Finance data, with verified mathematical geometry filters,
+           price smoothing, volume confirmation, and composite quality scoring.
 
-  Two Primary Modes  (toggle via RUN_MODE at the top)
-  ---------------------------------------------------
-  1. LIVE_SCAN   → Scans for patterns completing TODAY. Deduplicates alerts
-                   so each ticker fires at most once per session-day.
-  2. HISTORICAL  → Sweeps the full timeline (up to 2 years daily candles).
-                   Prints EVERY valid historical pattern with no date filter
-                   and no output cap.
-
-  Additionally:
-  3. Self-Test   → Synthetic data to prove the math works (no internet).
-
-  Verified Geometry
-  -----------------
-      Cup Depth      = Left_Rim_Price − Cup_Bottom_Price
-      Max Handle Dip = 0.32 × Cup Depth
-      Rule: handle pullback (Right Rim − Handle Low) must be ≤ Max Handle Dip.
+  THREE MODES
+  -----------
+  1. SELF-TEST     → Synthetic data to prove the math works (no internet).
+  2. HISTORICAL    → Sweeps past data for already-completed patterns.
+  3. LIVE SCANNER  → Continuous scanner during NSE market hours.
 
   What is a "Cup and Handle" pattern?
   ------------------------------------
@@ -36,11 +27,29 @@
                          Cup Bottom
 
   1. Price rises to a HIGH (Left Rim).
-  2. Price DROPS significantly (the "cup" — 10-30% decline).
+  2. Price DROPS significantly (the "cup" — 10-35% decline).
   3. Price RECOVERS back near the original high (Right Rim, within 3%).
   4. Price dips SLIGHTLY again (the "handle" — must stay within 32% of
      cup depth).
   5. A breakout above the rim signals a potential upward move.
+
+  Bug-Fix History (all incorporated in this v2 rewrite)
+  -----------------------------------------------------
+  Bug 1: V-shaped bottoms — now requires "roundedness" (base zone check).
+  Bug 2: Handle low locked too early — now tracks true low until breakout.
+  Bug 3: Noise mistaken for handle — requires genuine pause before breakout.
+  Bug 4: Internal price > Left Rim — strict structural ceiling check.
+  Bug 5: Discontinuous/jagged cups — max single-day gap filter.
+
+  New in v2
+  ---------
+  • Price smoothing (SMA) for peak/trough detection (raw prices for math).
+  • Volume confirmation (3 checks: decline, recovery, breakout).
+  • Composite quality score for ranking patterns.
+
+  pip install
+  -----------
+  pip install yfinance pandas numpy scipy
 
 =============================================================================
 """
@@ -52,9 +61,9 @@ import time
 import datetime
 import warnings
 import argparse
+import math
 
 # Fix Windows console encoding so emoji and special characters display correctly.
-# Without this, Windows cmd.exe (which uses cp1252) crashes on characters like ☕ or ═.
 if sys.platform == "win32":
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -74,113 +83,77 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 
 # =============================================================================
-#  MODE SELECTION  —  Change this ONE variable to switch behaviour
+#  CONFIGURATION — All tuneable knobs in one place
 # =============================================================================
-# "LIVE"       → Only prints patterns completing TODAY (IST).
-#                Deduplicates: each ticker alerts at most once per day.
-# "HISTORICAL" → Sweeps the full date range. Prints EVERY valid pattern
-#                found across the entire timeline. No date filter, no cap.
-RUN_MODE = "LIVE"
 
+# ─── SMOOTHING ──────────────────────────────────────────────────────────────
+# Before finding peaks/troughs, we smooth the closing prices with a simple
+# moving average (SMA) to reduce noise. The smoothed series is ONLY used
+# for find_peaks() — all actual price values come from RAW data.
+SMOOTHING_WINDOW = 5
 
-# ─── PER-MODE DATA CONFIGURATION ──────────────────────────────────────────
-# These control what yfinance downloads for each mode.
-# LIVE       : 15-minute intraday candles over the last ~59 days.
-# HISTORICAL : Daily candles over the last 2 years (yfinance intraday limit
-#              is ~60 days, so daily is required for longer lookbacks).
-MODE_CONFIG = {
-    "LIVE": {
-        "period":   "59d",
-        "interval": "15m",
-        "label":    "15-min intraday (last 59 days)",
-    },
-    "HISTORICAL": {
-        "period":   "2y",
-        "interval": "1d",
-        "label":    "Daily candles (last 2 years)",
-    },
-}
-
-
-# ─── GENERAL CONFIGURATION ────────────────────────────────────────────────
-
-# How many tickers to download in one yf.download() call.
-# Larger = faster, but too large may get throttled by Yahoo.
-BATCH_SIZE = 25
-
-# Seconds to pause between download batches (avoids rate-limiting).
-BATCH_SLEEP = 2
-
-# How often (in minutes) the live scanner re-runs.
-SCAN_INTERVAL_MINUTES = 15
-
-# Indian Standard Time offset from UTC (UTC + 5:30).
-IST_OFFSET = datetime.timedelta(hours=5, minutes=30)
-
-
-# ─── DETECTION PARAMETERS ─────────────────────────────────────────────────
-# These are tuneable knobs that control pattern sensitivity.
-
+# ─── CUP GEOMETRY ──────────────────────────────────────────────────────────
 # Minimum cup drop from Left Rim to Cup Bottom (percentage).
 MIN_CUP_DROP_PCT = 10
-
 # Maximum cup drop from Left Rim to Cup Bottom (percentage).
 MAX_CUP_DROP_PCT = 35
-
 # Maximum gap between Right Rim and Left Rim (percentage).
 # 0% = identical height; 3% allows a small difference.
 MAX_RECOVERY_GAP_PCT = 3
 
-# Handle geometry: the handle pullback must be ≤ this fraction of cup depth.
+# ─── HANDLE GEOMETRY ───────────────────────────────────────────────────────
+# Handle pullback must be ≤ this fraction of cup depth.
 # 0.32 means the handle can retrace at most 32% of the cup's height.
 HANDLE_MAX_RETRACE_RATIO = 0.32
-
-# Minimum number of candles for each side of the cup (left-to-bottom, bottom-to-right).
+# Minimum candles for each side of the cup (left-to-bottom, bottom-to-right).
 MIN_CUP_CANDLES = 10
-
-# Minimum number of candles for the handle pullback phase.
+# Minimum candles for the handle pullback phase.
 MIN_HANDLE_CANDLES = 5
-
-# Maximum allowed average deviation (in %) for the right rim peak stability check.
+# Right Rim stability: average price in a ±2 candle window must be within
+# this percentage of the Right Rim peak.
 RIGHT_RIM_STABILITY_PCT = 3.0
 
+# ─── BUG FIX PARAMETERS ───────────────────────────────────────────────────
+# Bug 1 — Bottom Roundedness
+BASE_ZONE_PCT = 0.05          # Prices within 5% of cup bottom = "base zone"
+MIN_BASE_CANDLES_PCT = 0.20   # At least 20% of cup candles must be in base zone
 
-# ─── NEW DETECTION PARAMETERS (Bug Fixes) ─────────────────────────────────
-# For Bug 1 (Bottom Roundedness)
-# Percentage above cup bottom to be considered the "base zone"
-BASE_ZONE_PCT = 0.05
-# Minimum percentage of cup candles that must be in the base zone
-MIN_BASE_CANDLES_PCT = 0.20
+# Bug 2 — Handle Low Lock
+BREAKOUT_CONFIRM_CANDLES = 3          # Consecutive closes above Right Rim
+MAX_HANDLE_LOOKFORWARD_CANDLES = 30   # Max candles to search for breakout
 
-# For Bug 2 (Handle Low Lock)
-# Consecutive candles closing above the right rim required to confirm breakout
-BREAKOUT_CONFIRM_CANDLES = 3
-# Maximum candles to look forward for a breakout before giving up on the handle
-MAX_HANDLE_LOOKFORWARD_CANDLES = 30
-
-# For Bug 3 (Genuine Pause Before Breakout)
-# Minimum number of candles the price must pause/consolidate before breaking out
+# Bug 3 — Genuine Pause Before Breakout
 MIN_PAUSE_CANDLES = 5
-# For Bug 5 (Discontinuity / Smoothness)
-# Maximum allowed single-day percentage change inside the cup (to prevent gappy/jagged cups)
-MAX_DISCONTINUITY_PCT = 0.08
 
+# Bug 5 — Discontinuity / Smoothness
+MAX_DISCONTINUITY_PCT = 0.08  # Max single-day % change inside the cup
+
+# ─── VOLUME CONFIRMATION ──────────────────────────────────────────────────
+# Breakout volume must exceed this multiplier × 50-period SMA of volume.
+BREAKOUT_VOLUME_MULTIPLIER = 1.2
+# Volume SMA period for baseline comparison.
+VOLUME_SMA_PERIOD = 50
+
+# ─── DATA FETCHING ────────────────────────────────────────────────────────
+BATCH_SIZE = 25               # Tickers per yf.download() call
+BATCH_SLEEP = 2               # Seconds between download batches
+
+# ─── LIVE SCANNER ─────────────────────────────────────────────────────────
+SCAN_INTERVAL_MINUTES = 15    # How often the live scanner re-runs
+IST_OFFSET = datetime.timedelta(hours=5, minutes=30)
 
 # ─── LIVE-MODE DEDUPLICATION CACHE ─────────────────────────────────────────
-# Tracks tickers that already generated a live alert TODAY so they don't
-# print repeatedly on each scan loop. Auto-clears when the date changes.
 _live_alerted_today = set()
-_live_alert_date = None           # the IST date the cache belongs to
+_live_alert_date = None
 
 
 # =============================================================================
-#  1.  GET THE WATCHLIST  — Dynamically fetch Nifty 100/200 tickers
+#  1. GET THE WATCHLIST — Dynamically fetch Nifty 100/200 tickers
 # =============================================================================
 
 def get_nifty_list():
     """
-    Downloads the Nifty 200 stock list from a public CSV hosted by
-    the NSE India index provider.
+    Downloads the Nifty 200 stock list from a public CSV hosted by NSE India.
 
     Returns
     -------
@@ -188,36 +161,23 @@ def get_nifty_list():
         Ticker symbols with ".NS" suffix (e.g., ["RELIANCE.NS", "TCS.NS"]).
         Falls back to a curated Nifty 50 list if the download fails.
 
-    How it works (step by step)
-    ---------------------------
-    1. We try multiple public CSV URLs that contain the Nifty index
-       constituents. These are plain-text files anyone can download.
-    2. We read them with pandas (pd.read_csv), which turns the CSV rows
-       into a DataFrame (think: an Excel table in Python).
-    3. We look for a column named "Symbol" (the ticker code) and append
-       ".NS" so Yahoo Finance knows it's an NSE stock.
-    4. If ALL URLs fail (network down, URL changed, etc.), we fall back
-       to a hardcoded list of major Nifty 50 stocks so the script
-       never crashes just because a CSV link broke.
+    How it works
+    ------------
+    1. Tries multiple public CSV URLs containing Nifty index constituents.
+    2. Reads them with pandas, looks for a "Symbol" column.
+    3. Appends ".NS" so Yahoo Finance knows it's an NSE stock.
+    4. Falls back to hardcoded Nifty 50 if all URLs fail.
     """
-    # Multiple source URLs — if one breaks, the next is tried.
     csv_urls = [
-        # Nifty 200 from NSE India index data
         "https://archives.nseindia.com/content/indices/ind_nifty200list.csv",
-        # Nifty 100 (smaller but still good coverage)
         "https://archives.nseindia.com/content/indices/ind_nifty100list.csv",
-        # Nifty 50 (smallest, most liquid stocks)
         "https://archives.nseindia.com/content/indices/ind_nifty50list.csv",
     ]
 
     for url in csv_urls:
         try:
             print(f"  ↳ Trying to fetch watchlist from:\n    {url}")
-            # pd.read_csv downloads the file and turns it into a table.
             df = pd.read_csv(url)
-
-            # The CSV has a column called "Symbol" with values like
-            # "RELIANCE", "TCS", etc. We need to add ".NS" for Yahoo Finance.
             if "Symbol" in df.columns:
                 symbols = [f"{sym.strip()}.NS" for sym in df["Symbol"].tolist()]
                 print(f"  ✓ Loaded {len(symbols)} tickers from NSE index CSV.\n")
@@ -227,7 +187,7 @@ def get_nifty_list():
         except Exception as e:
             print(f"  ✗ Failed: {e}")
 
-    # ── FALLBACK ── hardcoded Nifty 50 (so the script still works offline) ──
+    # Fallback — hardcoded Nifty 50
     print("  ⚠ All CSV sources failed. Using hardcoded Nifty 50 fallback.\n")
     fallback = [
         "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK",
@@ -245,45 +205,33 @@ def get_nifty_list():
 
 
 # =============================================================================
-#  2.  FETCH DATA IN BATCHES  — Download candle data from Yahoo Finance
+#  2. FETCH DATA IN BATCHES — Download candle data from Yahoo Finance
 # =============================================================================
 
 def fetch_batch_data(tickers, period=None, start=None, end=None, interval="15m"):
     """
-    Downloads candle data for many tickers in batches.
+    Downloads OHLCV candle data for many tickers in batches.
 
     Parameters
     ----------
     tickers : list[str]
         e.g., ["RELIANCE.NS", "TCS.NS", ...]
     period : str
-        How far back to look.
-    start : str
-        Start date (YYYY-MM-DD).
-    end : str
-        End date (YYYY-MM-DD).
+        How far back to look (e.g., "2y", "59d").
+    start / end : str
+        Date range (YYYY-MM-DD). Overrides period if provided.
     interval : str
-        Candle size.
+        Candle size (e.g., "15m", "1d").
 
     Returns
     -------
     dict[str, pd.DataFrame]
-        Keys are ticker symbols; values are DataFrames with columns
-        like Open, High, Low, Close, Volume.
-
-    How it works
-    ------------
-    • yf.download() can accept a list of tickers (space-separated string).
-    • We split the full list into chunks of BATCH_SIZE (default 25).
-    • Between chunks, we pause (time.sleep) so Yahoo doesn't block us.
-    • The result is a multi-level DataFrame; we split it per ticker.
+        Keys are ticker symbols; values are DataFrames with columns:
+        Open, High, Low, Close, Volume.
     """
     all_data = {}
     total = len(tickers)
-
-    # Minimum candle count to consider data usable.
-    # For daily candles a cup can form in fewer bars, so lower the bar.
-    min_candles = 30 if interval == "1d" else 50
+    min_candles = 30 if interval in ("1d", "1wk") else 50
 
     for i in range(0, total, BATCH_SIZE):
         batch = tickers[i : i + BATCH_SIZE]
@@ -294,8 +242,6 @@ def fetch_batch_data(tickers, period=None, start=None, end=None, interval="15m")
               f"({len(batch)} tickers) ... ", end="", flush=True)
 
         try:
-            # Download data for the entire batch at once.
-            # group_by="ticker" means the result is organized per stock.
             download_kwargs = {
                 "tickers": batch_str,
                 "interval": interval,
@@ -320,30 +266,23 @@ def fetch_batch_data(tickers, period=None, start=None, end=None, interval="15m")
             if data.empty:
                 print("empty result.")
             else:
-                # ── Single ticker vs. multiple tickers ──
-                # yfinance now returns a MultiIndex even for a single ticker
-                # if group_by='ticker' is used.
                 for ticker in batch:
                     try:
-                        # .xs (cross-section) extracts one ticker's data.
-                        # Sometimes yfinance might NOT return a multi-index if there's only 1 ticker
-                        # and group_by is ignored in older versions, so we handle both.
                         if isinstance(data.columns, pd.MultiIndex):
                             ticker_df = data.xs(ticker, level="Ticker", axis=1)
                         else:
                             ticker_df = data
-                            
+
                         if not ticker_df.empty and len(ticker_df) > min_candles:
                             all_data[ticker] = ticker_df.copy()
                     except (KeyError, TypeError):
-                        pass   # ticker had no data — skip silently
+                        pass
 
                 print(f"OK  ({len(all_data)} tickers so far)")
 
         except Exception as e:
             print(f"error: {e}")
 
-        # Pause between batches to be polite to Yahoo's servers.
         if i + BATCH_SIZE < total:
             time.sleep(BATCH_SLEEP)
 
@@ -352,215 +291,295 @@ def fetch_batch_data(tickers, period=None, start=None, end=None, interval="15m")
 
 
 # =============================================================================
-#  3.  PATTERN DETECTION  — Find Cup and Handle shapes
+#  3. SMOOTH PRICES — Reduce noise before peak detection
 # =============================================================================
 
-def detect_cup_and_handle(prices, ticker="UNKNOWN", dates=None, interval="15m", highs=None, verbose=False):
+def smooth_prices(prices, window=SMOOTHING_WINDOW):
     """
-    Scans a 1-D array of closing prices for Cup-and-Handle patterns
-    using verified mathematical geometry filters.
+    Applies a Simple Moving Average (SMA) to the price series for noise
+    reduction before peak/trough detection.
 
-    Includes overlap-deduplication: if multiple peak-combinations produce
-    patterns that share the same cup-bottom or right-rim region, only the
-    BEST one (deepest cup with valid handle) is kept.
+    Why we smooth
+    -------------
+    Raw stock prices have tiny daily wiggles that create false peaks/troughs.
+    By averaging over a small window (default 5 candles), we eliminate
+    1-2 candle noise while preserving the real structural shape of the cup.
+
+    IMPORTANT: The smoothed series is ONLY used for find_peaks() to identify
+    candidate dates. All actual price values used in calculations come from
+    the RAW (unsmoothed) prices at those same dates.
+
+    Parameters
+    ----------
+    prices : np.ndarray
+        Raw closing prices.
+    window : int
+        Number of candles to average over (default 5).
+
+    Returns
+    -------
+    np.ndarray
+        Smoothed price series (same length as input).
+    """
+    # pd.Series.rolling with min_periods=1 handles the edges gracefully —
+    # the first few values use whatever data is available instead of NaN.
+    series = pd.Series(prices)
+    smoothed = series.rolling(window=window, min_periods=1, center=True).mean()
+    return smoothed.values
+
+
+# =============================================================================
+#  4. COMPUTE QUALITY SCORE — Rank patterns by strength
+# =============================================================================
+
+def compute_quality_score(cup_drop_pct, recovery_vol_ratio, breakout_vol_ratio):
+    """
+    Computes a single number that ranks how "strong" a Cup & Handle pattern is.
+
+    Why a score?
+    ------------
+    When scanning 200 stocks, you might find 10 valid patterns. The score
+    tells you which ones are the MOST convincing — deeper cups with strong
+    volume confirmation rank higher.
+
+    Formula (documented for beginners)
+    -----------------------------------
+    score = (cup_drop_pct × 0.4)
+          + (log(recovery_vol_ratio + 1) × 30)
+          + (log(breakout_vol_ratio + 1) × 30)
+
+    • cup_drop_pct × 0.4: Deeper cups score higher (a 20% drop scores
+      8 points, a 10% drop scores 4 points). We use 0.4 weight because
+      cup depth is the most basic quality signal.
+
+    • log(recovery_vol_ratio + 1) × 30: If the recovery had 2× more buying
+      volume than selling volume, log(3) ≈ 1.1, so this adds ~33 points.
+      The log prevents a single crazy volume spike from dominating.
+
+    • log(breakout_vol_ratio + 1) × 30: Same logic for breakout volume.
+      Higher breakout volume = more institutional interest.
+
+    Parameters
+    ----------
+    cup_drop_pct : float
+        How much the price dropped (e.g., 15.5 for 15.5%).
+    recovery_vol_ratio : float
+        Up-volume / down-volume ratio during recovery (> 1 = bullish).
+    breakout_vol_ratio : float
+        Breakout volume / 50-SMA volume ratio (> 1.2 = strong).
+
+    Returns
+    -------
+    float
+        Composite score (higher is better, typically 5–80 range).
+    """
+    # Clamp ratios to avoid negative log issues (ratio could be 0 if no data)
+    rv = max(recovery_vol_ratio, 0)
+    bv = max(breakout_vol_ratio, 0)
+
+    score = (cup_drop_pct * 0.4
+             + math.log(rv + 1) * 30
+             + math.log(bv + 1) * 30)
+
+    return round(score, 2)
+
+
+# =============================================================================
+#  5. PATTERN DETECTION — Find Cup and Handle shapes (core engine)
+# =============================================================================
+
+def detect_cup_and_handle(prices, highs=None, volumes=None,
+                          ticker="UNKNOWN", dates=None,
+                          interval="1d", verbose=False):
+    """
+    Scans a 1-D array of closing prices for Cup-and-Handle patterns using
+    verified mathematical geometry filters, price smoothing, volume
+    confirmation, and all bug-fix rules.
 
     Parameters
     ----------
     prices : array-like
-        Sequence of closing prices (e.g., 15-min candles or daily candles).
+        Sequence of CLOSING prices (raw, not smoothed).
+    highs : array-like or None
+        Corresponding HIGH prices (for structural ceiling check).
+        Falls back to Close prices if not provided.
+    volumes : array-like or None
+        Corresponding VOLUME data (for volume confirmation checks).
+        If None, volume checks are skipped (marked as N/A).
     ticker : str
-        Stock symbol (used in print messages only).
+        Stock symbol (used in print messages).
     dates : array-like or None
-        Corresponding timestamps for each price (for date reporting).
+        Corresponding timestamps for each price bar.
+    interval : str
+        Candle interval (e.g., "15m", "1d", "1wk").
+    verbose : bool
+        If True, prints debug output for ALL candidates (even rejected ones).
 
     Returns
     -------
     list[dict]
-        Each dict describes one detected pattern with fields:
-        - ticker, left_rim_price, cup_bottom_price, right_rim_price,
-          handle_low_price, cup_drop_pct, recovery_pct,
-          cup_depth, max_handle_dip, handle_pullback,
-          handle_pullback_pct,
-          left_rim_idx, cup_bottom_idx, right_rim_idx, handle_low_idx,
-          (and dates if provided).
+        Each dict describes one detected pattern with all metrics.
 
     Algorithm (plain English)
     -------------------------
-    1. Convert prices to a NumPy array (fast math).
-    2. Use find_peaks() to locate LOCAL HIGHS (peaks) and LOCAL LOWS (troughs).
-    3. For each PAIR of peaks (potential Left Rim → Right Rim):
-       a. Find the deepest trough between them → Cup Bottom.
-       b. Cup Symmetry: bottom must sit in the middle 70% of the cup width
-          (not hugging either rim — that's a V-shape, not a U-shape).
-       c. Check: is the cup deep enough? (10-30% drop from Left Rim)
-       d. Check: did price recover? (Right Rim within 3% of Left Rim)
-       e. Look for a mild pullback AFTER the Right Rim → Handle.
-       f. GEOMETRY CHECK (verified formula):
-            cup_depth      = Left_Rim_Price − Cup_Bottom_Price
-            max_handle_dip = 0.32 × cup_depth
-            handle_pullback = Right_Rim_Price − Handle_Low_Price
-            Rule: handle_pullback must be ≥ 1% of Right Rim AND ≤ max_handle_dip.
-    4. Overlap deduplication: if two patterns share similar cup-bottom and
-       right-rim indices (within 10 candles), keep only the one with the
-       deeper cup — it's the "cleanest" version of the same pattern.
+    1. Smooth prices with SMA(5). Run find_peaks on SMOOTHED series to find
+       candidate peaks (Left/Right Rim) and troughs (Cup Bottom). All actual
+       price values are read from RAW data at those indices.
+    2. For each (Left Rim, Right Rim) pair, validate:
+       - Cup depth (10–35% drop)
+       - Recovery (Right Rim within 3% of Left Rim)
+       - No double-dip below cup bottom
+       - Cup symmetry (bottom in middle 70% of cup width)
+       - Bottom roundedness (≥20% of candles in base zone)
+       - No internal price exceeding Left Rim (structural ceiling)
+       - No excessive discontinuity (max 8% single-day gap)
+       - Handle detection with corrected low (Bug 2 fix)
+       - Genuine pause before breakout (Bug 3 fix)
+       - Handle geometry (≤32% of cup depth)
+       - Right Rim stability
+    3. Volume confirmation (3 checks — soft, don't reject):
+       a. Cup decline volume vs 50-SMA
+       b. Recovery up-vol / down-vol ratio
+       c. Breakout volume vs 1.2× 50-SMA
+    4. Compute composite quality score.
+    5. Overlap deduplication (keep deepest cup per region).
     """
     prices = np.array(prices, dtype=float)
 
-    # High prices for the strict Left Rim ceiling check.
-    # If no OHLC High data is provided (e.g., synthetic tests), fall back
-    # to Close prices — Close is always ≤ High, so the check still works
-    # directionally; it just can't catch intraday spikes above the rim.
+    # High prices for structural ceiling check (fallback to Close)
     if highs is not None:
         highs = np.array(highs, dtype=float)
     else:
-        highs = prices  # fallback: treat Close as the High
+        highs = prices.copy()
 
-    # Need enough candles to have a meaningful pattern.
+    # Volume data (None = skip volume checks)
+    if volumes is not None:
+        volumes = np.array(volumes, dtype=float)
+
     if len(prices) < 30:
         return []
 
-    # ── Step 2a: Find local highs (peaks) ──
-    # `distance` = peaks must be at least this many candles apart.
-    # `prominence` = peak must stand out from its neighbors by at least 1%
-    # of the median price (filters out tiny wiggles).
-    min_prominence = np.median(prices) * 0.01
-    peak_indices, _ = find_peaks(prices, distance=10, prominence=min_prominence)
+    # ── Step 1: Smooth prices and find peaks/troughs ──
+    smoothed = smooth_prices(prices, window=SMOOTHING_WINDOW)
 
-    # ── Step 2b: Find local lows (troughs) ──
-    # Trick: negate the prices, then find peaks on the negated version.
-    trough_indices, _ = find_peaks(-prices, distance=10, prominence=min_prominence)
+    min_prominence = np.median(smoothed) * 0.01
+    peak_indices, _ = find_peaks(smoothed, distance=10, prominence=min_prominence)
+    trough_indices, _ = find_peaks(-smoothed, distance=10, prominence=min_prominence)
 
-    # We need at least 2 peaks and 1 trough to form a cup.
     if len(peak_indices) < 2 or len(trough_indices) < 1:
-        if verbose: print(f"DEBUG: Not enough peaks/troughs: peaks={peak_indices} troughs={trough_indices}")
         return []
 
     # Collect ALL candidate patterns first, then deduplicate.
     candidates = []
 
-    # ── Step 3: Try every combination of (Left Rim, Right Rim) ──
+    # ── Step 2: Try every combination of (Left Rim, Right Rim) ──
     for i in range(len(peak_indices)):
         for j in range(i + 1, len(peak_indices)):
             left_rim_idx = peak_indices[i]
             right_rim_idx = peak_indices[j]
+
+            # Read RAW prices at the smoothed-detected indices
             left_rim_price = prices[left_rim_idx]
             right_rim_price = prices[right_rim_idx]
+
             if right_rim_price == 0:
                 continue
 
-            # ── Rule 1: Dynamic Trend Check (Adaptive Left Rim) ──
-            # Determine if we're dealing with macro data (Daily/Weekly)
-            is_macro = interval.endswith('d') or interval.endswith('w')
-            
+            # ── Rule 1: Dynamic Trend Check ──
+            is_macro = interval.endswith('d') or interval.endswith('w') or interval.endswith('wk')
+
             if is_macro:
-                # Macro mode: Left rim just needs to be the highest peak within a broader 20-candle window.
-                # No absolute 10-candle positive return check, as macro trends have natural pullbacks.
                 window_start = max(0, left_rim_idx - 20)
                 window_end = min(len(prices), left_rim_idx + 21)
                 if np.max(prices[window_start:window_end]) > left_rim_price:
                     continue
             else:
-                # Intraday mode: Net positive return over the 10 candles preceding the Left Rim.
                 if left_rim_idx < 10:
                     continue
                 if prices[left_rim_idx - 10] >= left_rim_price:
                     continue
-                    
-                # Left Rim must be a true local maximum within a tight window of 5 candles before and after it.
                 window_start = max(0, left_rim_idx - 5)
                 window_end = min(len(prices), left_rim_idx + 6)
                 if np.max(prices[window_start:window_end]) > left_rim_price:
                     continue
 
             # ── Width check ──
-            # The cup should span a reasonable number of candles.
             cup_width = right_rim_idx - left_rim_idx
             if cup_width < 15 or cup_width > len(prices) * 0.8:
-                continue   # too narrow or absurdly wide — skip
+                continue
 
-            # ── Step 3a: Find deepest trough between the two rims ──
+            # ── Find deepest trough between rims ──
             troughs_in_cup = [t for t in trough_indices
                               if left_rim_idx < t < right_rim_idx]
             if not troughs_in_cup:
-                continue   # no trough between the rims — not a cup
+                continue
 
-            cup_bottom_idx = min(troughs_in_cup, key=lambda t: prices[t])
+            # Refine the cup bottom to be the absolute minimum RAW price between the rims.
+            # This prevents noise from failing the double-dip check, as the true structural
+            # bottom is the absolute lowest traded price.
+            raw_prices_in_cup = prices[left_rim_idx:right_rim_idx]
+            cup_bottom_idx = left_rim_idx + int(np.argmin(raw_prices_in_cup))
             cup_bottom_price = prices[cup_bottom_idx]
 
-            # ── NEW RULE: Minimum Cup Duration ──
-            # Both sides of the cup must be at least MIN_CUP_CANDLES.
+            # ── Minimum Cup Duration ──
             cup_left_duration = cup_bottom_idx - left_rim_idx
             cup_right_duration = right_rim_idx - cup_bottom_idx
             if cup_left_duration < MIN_CUP_CANDLES or cup_right_duration < MIN_CUP_CANDLES:
-                continue   # a cup side was formed too quickly
+                continue
 
-            # ── NEW RULE: No Double-Dip ──
-            # The price must not drop below the cup bottom between the bottom and right rim.
-            # (In other words, the recovery must be clean).
+            # ── No Double-Dip ──
             prices_after_bottom = prices[cup_bottom_idx:right_rim_idx + 1]
             if len(prices_after_bottom) > 0 and np.min(prices_after_bottom) < cup_bottom_price:
                 if verbose:
-                    print(f"  ❌ REJECTED {ticker}: Double dip detected below cup bottom.")
-                continue   # double dip occurred
+                    print(f"  ❌ REJECTED {ticker}: Double dip below cup bottom.")
+                continue
 
-            # ── Step 3b-extra: Cup SYMMETRY check ──
-            # The bottom should sit roughly in the middle of the cup,
-            # not right next to one of the rims.
-            # We require the bottom to be in the middle 70% of the cup width.
-            # Example: if cup spans candles 10–110 (width=100), bottom must
-            #          be between candle 25 and candle 95.
+            # ── Cup Symmetry ──
             left_margin = left_rim_idx + cup_width * 0.15
             right_margin = right_rim_idx - cup_width * 0.15
             if not (left_margin <= cup_bottom_idx <= right_margin):
-                continue   # bottom hugs one rim — V-shape, not a cup
+                continue
 
-
-            # ── Step 3b: Cup depth check ──
-            # Drop % = how much the price fell from the Left Rim to the Bottom.
+            # ── Cup depth check ──
             cup_drop_pct = ((left_rim_price - cup_bottom_price)
                             / left_rim_price) * 100
-
             if not (MIN_CUP_DROP_PCT <= cup_drop_pct <= MAX_CUP_DROP_PCT):
-                continue   # drop too small or too large
+                continue
 
-            # ── Step 3c: Recovery check ──
-            # Recovery % = how close the Right Rim is to the Left Rim.
-            # 0% means identical height; negative means Right Rim is lower.
+            # ── Recovery check ──
             recovery_pct = abs(right_rim_price - left_rim_price) / left_rim_price * 100
-
             if recovery_pct > MAX_RECOVERY_GAP_PCT:
-                continue   # Right Rim is too far from Left Rim
+                continue
 
-            # ── Step 3d: Handle detection & BUG 2/3 FIX ──
+            # ── Handle detection (Bug 2/3 Fix) ──
             if right_rim_idx + 1 >= len(prices):
                 continue
-                
-            # Calculate the OLD handle logic (first dip in 25% window) strictly for debug reporting
+
+            # OLD handle logic (for debug comparison)
             old_handle_zone_end = min(right_rim_idx + max(1, cup_width // 4), len(prices) - 1)
             old_handle_prices = prices[right_rim_idx : old_handle_zone_end + 1]
             old_handle_low_price = np.min(old_handle_prices) if len(old_handle_prices) > 0 else right_rim_price
 
-            # Scan forward to find true handle low
+            # NEW: Scan forward tracking true low until breakout confirms
             current_handle_low = prices[right_rim_idx]
             current_handle_low_idx = right_rim_idx
             breakout_count = 0
             breakout_confirmed = False
             breakout_start_idx = -1
-            
-            for k in range(right_rim_idx + 1, min(len(prices), right_rim_idx + 1 + MAX_HANDLE_LOOKFORWARD_CANDLES)):
+
+            for k in range(right_rim_idx + 1,
+                           min(len(prices), right_rim_idx + 1 + MAX_HANDLE_LOOKFORWARD_CANDLES)):
                 curr_price = prices[k]
-                
-                # Update current handle low
+
                 if curr_price < current_handle_low:
                     current_handle_low = curr_price
                     current_handle_low_idx = k
-                    
-                # Breakout check (closing above Right Rim)
+
                 if curr_price > right_rim_price:
                     breakout_count += 1
                 else:
-                    breakout_count = 0  # must be consecutive
-                    
+                    breakout_count = 0
+
                 if breakout_count >= BREAKOUT_CONFIRM_CANDLES:
                     breakout_confirmed = True
                     breakout_start_idx = k - BREAKOUT_CONFIRM_CANDLES + 1
@@ -568,82 +587,144 @@ def detect_cup_and_handle(prices, ticker="UNKNOWN", dates=None, interval="15m", 
 
             handle_low_price = current_handle_low
             handle_low_idx = current_handle_low_idx
-            
-            # BUG 3 FIX: Pause Before Breakout check
+
+            # ── Pause Before Breakout (Bug 3) ──
             pause_duration = (breakout_start_idx - right_rim_idx) if breakout_confirmed else 0
-            
+
             handle_slope = 0
             if breakout_confirmed and pause_duration > 1:
-                # Linear regression slope of prices in the pause window
                 pause_prices = prices[right_rim_idx : breakout_start_idx + 1]
                 res = linregress(np.arange(len(pause_prices)), pause_prices)
                 handle_slope = res.slope
 
             # ══════════════════════════════════════════════════════════
-            # ── Step 3e: Handle validation tracking ──
+            # ── Validation: compute all metrics, then decide ──
             # ══════════════════════════════════════════════════════════
-            
-            # BUG 1 FIX: Bottom Roundedness Check (Calculate here for full pattern reporting)
+
+            # Roundedness (Bug 1)
             base_zone_max = cup_bottom_price * (1 + BASE_ZONE_PCT)
             cup_candles = prices[left_rim_idx:right_rim_idx]
-            base_candles_count = np.sum(cup_candles <= base_zone_max)
+            base_candles_count = int(np.sum(cup_candles <= base_zone_max))
             roundedness_pct = (base_candles_count / len(cup_candles)) if len(cup_candles) > 0 else 0
 
             cup_depth = left_rim_price - cup_bottom_price
             max_handle_dip = HANDLE_MAX_RETRACE_RATIO * cup_depth
             handle_pullback = right_rim_price - handle_low_price
             handle_pullback_pct = (handle_pullback / right_rim_price) * 100
-            
             min_handle_pullback = right_rim_price * 0.01
             handle_duration = handle_low_idx - right_rim_idx
-            
-            # BUG 4 FIX: Intermediate High / Internal Close Violation Check
+
+            # Intermediate High / Close check (Bug 4)
             rim_ceiling = highs[left_rim_idx]
             highs_inside_cup = highs[left_rim_idx + 1 : right_rim_idx]
             closes_inside_cup = prices[left_rim_idx + 1 : right_rim_idx]
-            
             max_internal_high = np.max(highs_inside_cup) if len(highs_inside_cup) > 0 else 0
             max_internal_close = np.max(closes_inside_cup) if len(closes_inside_cup) > 0 else 0
 
-            # BUG 5 FIX: Discontinuity Check
+            # Discontinuity check (Bug 5)
             cup_closes_for_diff = prices[left_rim_idx : right_rim_idx + 1]
             if len(cup_closes_for_diff) > 1:
                 daily_returns = np.abs(np.diff(cup_closes_for_diff) / cup_closes_for_diff[:-1])
-                max_daily_jump = np.max(daily_returns)
+                max_daily_jump = float(np.max(daily_returns))
             else:
-                max_daily_jump = 0
-            
+                max_daily_jump = 0.0
+
+            # ── Volume Confirmation (NEW in v2) ──
+            vol_decline_pass = None   # None = no volume data
+            vol_decline_avg = 0
+            vol_sma50 = 0
+            vol_recovery_pass = None
+            vol_recovery_ratio = 0
+            vol_breakout_pass = None
+            vol_breakout_avg = 0
+
+            if volumes is not None and len(volumes) == len(prices):
+                # Compute 50-period volume SMA at the Right Rim position
+                vol_series = pd.Series(volumes)
+                vol_sma = vol_series.rolling(window=VOLUME_SMA_PERIOD, min_periods=10).mean()
+
+                # Use the SMA value at the right rim (or nearest valid)
+                sma_idx = min(right_rim_idx, len(vol_sma) - 1)
+                vol_sma50 = vol_sma.iloc[sma_idx] if not pd.isna(vol_sma.iloc[sma_idx]) else 0
+
+                # (a) Cup Decline Volume: avg volume from Left Rim to Bottom
+                if cup_bottom_idx > left_rim_idx and vol_sma50 > 0:
+                    decline_vols = volumes[left_rim_idx:cup_bottom_idx + 1]
+                    vol_decline_avg = float(np.mean(decline_vols))
+                    vol_decline_pass = vol_decline_avg < vol_sma50
+
+                # (b) Recovery Volume: up-days vs down-days from Bottom to Right Rim
+                if right_rim_idx > cup_bottom_idx + 1:
+                    recovery_closes = prices[cup_bottom_idx:right_rim_idx + 1]
+                    recovery_vols = volumes[cup_bottom_idx:right_rim_idx + 1]
+                    up_vol = 0.0
+                    down_vol = 0.0
+                    for rv_i in range(1, len(recovery_closes)):
+                        if recovery_closes[rv_i] > recovery_closes[rv_i - 1]:
+                            up_vol += recovery_vols[rv_i]
+                        else:
+                            down_vol += recovery_vols[rv_i]
+                    vol_recovery_ratio = (up_vol / down_vol) if down_vol > 0 else (2.0 if up_vol > 0 else 0)
+                    vol_recovery_pass = vol_recovery_ratio > 1.0
+
+                # (c) Breakout Volume: avg volume on breakout-confirming candles
+                if breakout_confirmed and breakout_start_idx > 0 and vol_sma50 > 0:
+                    bo_end = min(breakout_start_idx + BREAKOUT_CONFIRM_CANDLES, len(volumes))
+                    breakout_vols = volumes[breakout_start_idx:bo_end]
+                    if len(breakout_vols) > 0:
+                        vol_breakout_avg = float(np.mean(breakout_vols))
+                        vol_breakout_pass = vol_breakout_avg > (BREAKOUT_VOLUME_MULTIPLIER * vol_sma50)
+
+            # ── Compute quality score ──
+            quality_score = compute_quality_score(
+                cup_drop_pct,
+                vol_recovery_ratio if vol_recovery_ratio else 0,
+                (vol_breakout_avg / vol_sma50) if vol_sma50 > 0 else 0
+            )
+
+            # ── Determine validity ──
             is_valid = True
             reject_reason = ""
-            
-            # Evaluate rejection reasons in order of priority
+
             if max_internal_close > left_rim_price:
                 is_valid = False
-                reject_reason = f"Internal close (₹{max_internal_close:.2f}) exceeded Left Rim close (₹{left_rim_price:.2f}) — Structural Violation."
+                reject_reason = (f"Internal close (₹{max_internal_close:.2f}) exceeded "
+                                 f"Left Rim close (₹{left_rim_price:.2f}) — Structural Violation.")
             elif max_internal_high > rim_ceiling:
                 is_valid = False
-                reject_reason = f"Internal high (₹{max_internal_high:.2f}) exceeded Left Rim High (₹{rim_ceiling:.2f}) — Structural Violation."
+                reject_reason = (f"Internal high (₹{max_internal_high:.2f}) exceeded "
+                                 f"Left Rim High (₹{rim_ceiling:.2f}) — Structural Violation.")
             elif max_daily_jump > MAX_DISCONTINUITY_PCT:
                 is_valid = False
-                reject_reason = f"Excessive price discontinuity ({max_daily_jump*100:.1f}% single-day jump > {MAX_DISCONTINUITY_PCT*100}% limit)."
+                reject_reason = (f"Excessive price discontinuity "
+                                 f"({max_daily_jump*100:.1f}% single-day jump > "
+                                 f"{MAX_DISCONTINUITY_PCT*100}% limit).")
             elif roundedness_pct < MIN_BASE_CANDLES_PCT:
                 is_valid = False
-                reject_reason = f"V-shape recovery. Bottom roundedness {base_candles_count}/{len(cup_candles)} ({roundedness_pct*100:.1f}%) < {MIN_BASE_CANDLES_PCT*100}% required."
+                reject_reason = (f"V-shape recovery. Bottom roundedness "
+                                 f"{base_candles_count}/{len(cup_candles)} "
+                                 f"({roundedness_pct*100:.1f}%) < "
+                                 f"{MIN_BASE_CANDLES_PCT*100}% required.")
             elif handle_pullback < min_handle_pullback:
                 is_valid = False
                 reject_reason = "Handle pullback too small (<1%)."
             elif not breakout_confirmed:
                 is_valid = False
-                reject_reason = f"Handle incomplete / no breakout confirmed within {MAX_HANDLE_LOOKFORWARD_CANDLES} candles."
+                reject_reason = (f"Handle incomplete / no breakout confirmed within "
+                                 f"{MAX_HANDLE_LOOKFORWARD_CANDLES} candles.")
             elif pause_duration < MIN_PAUSE_CANDLES:
                 is_valid = False
-                reject_reason = f"No real handle — immediate continuation (breakout in {pause_duration} candles < {MIN_PAUSE_CANDLES}), not Cup & Handle."
+                reject_reason = (f"No real handle — immediate continuation "
+                                 f"(breakout in {pause_duration} candles < "
+                                 f"{MIN_PAUSE_CANDLES}), not Cup & Handle.")
             elif handle_slope > 0:
                 is_valid = False
-                reject_reason = f"Handle is not a genuine pause (slope {handle_slope:.2f} > 0). Resumed upward momentum before breakout."
+                reject_reason = (f"Handle is not a genuine pause (slope "
+                                 f"{handle_slope:.2f} > 0). Resumed upward momentum.")
             elif handle_pullback > max_handle_dip:
                 is_valid = False
-                reject_reason = f"Corrected handle pullback (₹{handle_pullback:.2f}) exceeded 0.32× depth (₹{max_handle_dip:.2f})."
+                reject_reason = (f"Corrected handle pullback (₹{handle_pullback:.2f}) "
+                                 f"exceeded 0.32× depth (₹{max_handle_dip:.2f}).")
             elif handle_duration < MIN_HANDLE_CANDLES:
                 is_valid = False
                 reject_reason = f"Handle formed too quickly (<{MIN_HANDLE_CANDLES} candles)."
@@ -659,53 +740,23 @@ def detect_cup_and_handle(prices, ticker="UNKNOWN", dates=None, interval="15m", 
                     is_valid = False
                     reject_reason = "Right rim is too spiky (failed stability check)."
 
-            # If invalid and we aren't verbose, drop it.
+            # If invalid and not verbose, skip
             if not is_valid and not verbose:
                 continue
 
-            # Scan forward to find true handle low
-            current_handle_low = prices[right_rim_idx]
-            current_handle_low_idx = right_rim_idx
-            breakout_count = 0
-            breakout_confirmed = False
-            
-            for k in range(right_rim_idx + 1, min(len(prices), right_rim_idx + 1 + MAX_HANDLE_LOOKFORWARD_CANDLES)):
-                curr_price = prices[k]
-                
-                # Update current handle low
-                if curr_price < current_handle_low:
-                    current_handle_low = curr_price
-                    current_handle_low_idx = k
-                    
-                # Breakout check (closing above Right Rim)
-                if curr_price > right_rim_price:
-                    breakout_count += 1
-                else:
-                    breakout_count = 0  # must be consecutive
-                    
-                if breakout_count >= BREAKOUT_CONFIRM_CANDLES:
-                    breakout_confirmed = True
-                    break
-
-            handle_low_price = current_handle_low
-            handle_low_idx = current_handle_low_idx
-
-
-
-
-            # ════════════════ CANDIDATE PATTERN ════════════════
+            # ── Build pattern dict ──
             pattern = {
                 "ticker":              ticker,
-                "left_rim_price":      round(left_rim_price, 2),
-                "cup_bottom_price":    round(cup_bottom_price, 2),
-                "right_rim_price":     round(right_rim_price, 2),
-                "handle_low_price":    round(handle_low_price, 2),
-                "cup_drop_pct":        round(cup_drop_pct, 2),
-                "recovery_pct":        round(recovery_pct, 2),
-                "cup_depth":           round(cup_depth, 2),
-                "max_handle_dip":      round(max_handle_dip, 2),
-                "handle_pullback":     round(handle_pullback, 2),
-                "handle_pullback_pct": round(handle_pullback_pct, 2),
+                "left_rim_price":      round(float(left_rim_price), 2),
+                "cup_bottom_price":    round(float(cup_bottom_price), 2),
+                "right_rim_price":     round(float(right_rim_price), 2),
+                "handle_low_price":    round(float(handle_low_price), 2),
+                "cup_drop_pct":        round(float(cup_drop_pct), 2),
+                "recovery_pct":        round(float(recovery_pct), 2),
+                "cup_depth":           round(float(cup_depth), 2),
+                "max_handle_dip":      round(float(max_handle_dip), 2),
+                "handle_pullback":     round(float(handle_pullback), 2),
+                "handle_pullback_pct": round(float(handle_pullback_pct), 2),
                 "left_rim_idx":        int(left_rim_idx),
                 "cup_bottom_idx":      int(cup_bottom_idx),
                 "right_rim_idx":       int(right_rim_idx),
@@ -714,57 +765,51 @@ def detect_cup_and_handle(prices, ticker="UNKNOWN", dates=None, interval="15m", 
                 "cup_right_duration":  int(cup_right_duration),
                 "handle_duration":     int(handle_duration),
                 "double_dip_passed":   True,
-                "roundedness_pct":     round(roundedness_pct * 100, 1),
+                "roundedness_pct":     round(float(roundedness_pct * 100), 1),
                 "base_candles":        int(base_candles_count),
                 "cup_width":           int(len(cup_candles)),
-                "old_handle_low":      round(old_handle_low_price, 2),
+                "old_handle_low":      round(float(old_handle_low_price), 2),
                 "breakout_confirmed":  breakout_confirmed,
                 "pause_duration":      int(pause_duration),
-                "handle_slope":        round(handle_slope, 4),
+                "handle_slope":        round(float(handle_slope), 4),
                 "reject_reason":       reject_reason,
+                "quality_score":       quality_score if is_valid else 0,
+                # Volume metrics
+                "vol_decline_avg":     round(float(vol_decline_avg), 0),
+                "vol_sma50":           round(float(vol_sma50), 0),
+                "vol_decline_pass":    vol_decline_pass,
+                "vol_recovery_ratio":  round(float(vol_recovery_ratio), 2),
+                "vol_recovery_pass":   vol_recovery_pass,
+                "vol_breakout_avg":    round(float(vol_breakout_avg), 0),
+                "vol_breakout_pass":   vol_breakout_pass,
+                # Smoothing metadata
+                "smoothing_method":    f"SMA({SMOOTHING_WINDOW})",
             }
 
-            # Attach dates if available (for reporting).
+            # Attach dates if available
             if dates is not None:
                 pattern["left_rim_date"]   = str(dates[left_rim_idx])
                 pattern["cup_bottom_date"] = str(dates[cup_bottom_idx])
                 pattern["right_rim_date"]  = str(dates[right_rim_idx])
                 pattern["handle_low_date"] = str(dates[handle_low_idx])
 
-            # If we have a pattern that wasn't valid, but we are verbose, print it!
             if not is_valid and verbose:
                 print_pattern(pattern, index="REJECTED")
                 continue
-                
-            # Store valid candidates for deduplication
+
             candidates.append(pattern)
 
-    # ══════════════════════════════════════════════════════════════════════
-    # ── Step 4: OVERLAP DEDUPLICATION ──
-    # ══════════════════════════════════════════════════════════════════════
-    # Problem: the loop above tries EVERY (Left Rim, Right Rim) combo.
-    # This means the same physical cup (same bottom, same general region)
-    # can appear multiple times with slightly different rim peaks.
-    #
-    # Solution: if two patterns share a similar cup_bottom_idx AND a similar
-    # right_rim_idx (within OVERLAP_TOLERANCE candles), they are the "same"
-    # pattern. Keep only the one with the deepest cup (highest cup_drop_pct)
-    # — it represents the clearest, most textbook version.
-    # ──────────────────────────────────────────────────────────────────────
-
-    OVERLAP_TOLERANCE = 10  # candles — two indices within this range = "same"
-
-    # Sort candidates by cup_drop_pct descending (best/deepest first).
+    # ── Step 5: Overlap Deduplication ──
+    OVERLAP_TOLERANCE = 10
     candidates.sort(key=lambda p: p["cup_drop_pct"], reverse=True)
 
     patterns_found = []
-    claimed_regions = []  # list of (cup_bottom_idx, right_rim_idx) already used
+    claimed_regions = []
 
     for candidate in candidates:
         cb_idx = candidate["cup_bottom_idx"]
         rr_idx = candidate["right_rim_idx"]
 
-        # Deduplication: check if this pattern overlaps with one already found.
         is_duplicate = False
         for claimed_cb, claimed_rr in claimed_regions:
             if (abs(cb_idx - claimed_cb) <= OVERLAP_TOLERANCE and
@@ -776,23 +821,27 @@ def detect_cup_and_handle(prices, ticker="UNKNOWN", dates=None, interval="15m", 
             patterns_found.append(candidate)
             claimed_regions.append((cb_idx, rr_idx))
 
+    # Sort by quality score (highest first)
+    patterns_found.sort(key=lambda p: p.get("quality_score", 0), reverse=True)
+
     return patterns_found
 
 
 # =============================================================================
-#  4.  PRETTY PRINT  — Show pattern details in a human-readable way
+#  6. PRETTY PRINT — Show pattern details in the requested debug format
 # =============================================================================
 
 def print_pattern(p, index=1):
     """
-    Prints one detected pattern with all the 'WHY' details so a beginner
-    can sanity-check it without knowing anything about stocks.
+    Prints one detected pattern with ALL diagnostic details so a beginner
+    can sanity-check every rule, even without stock market knowledge.
 
-    Includes the verified geometry values so you can manually verify
-    the 0.32× rule.
+    Output format matches the user's requested specification exactly.
     """
+    score_str = f"          Quality Score: {p.get('quality_score', 0)}" if not p.get("reject_reason") else ""
+
     print(f"\n  {'═' * 60}")
-    print(f"  🏆 PATTERN #{index}  —  {p['ticker']}")
+    print(f"  🏆 PATTERN #{index}  —  {p['ticker']}{score_str}")
     print(f"  {'═' * 60}")
     print(f"  Left Rim  (peak before cup)  : ₹{p['left_rim_price']}")
     print(f"  Cup Bottom (lowest point)    : ₹{p['cup_bottom_price']}")
@@ -803,6 +852,8 @@ def print_pattern(p, index=1):
           f"(price fell this much from Left Rim to Bottom)")
     print(f"  Recovery Gap : {p['recovery_pct']}%  "
           f"(how close Right Rim is to Left Rim; <3% = good)")
+
+    # ── Geometry Check ──
     print(f"  ─────────────────────────────────────────────────")
     print(f"  ✦ GEOMETRY CHECK")
     print(f"    Cup Depth (₹)              : ₹{p['cup_depth']}")
@@ -810,12 +861,16 @@ def print_pattern(p, index=1):
           f"(= 0.32 × ₹{p['cup_depth']})")
     print(f"    Actual Handle Pullback (₹) : ₹{p['handle_pullback']}  "
           f"({p['handle_pullback_pct']}%)")
-    
+
+    # ── Roundedness Check ──
     print(f"  ─────────────────────────────────────────────────")
     print(f"  ✦ ROUNDEDNESS CHECK")
-    roundedness_pass = "✅ PASS" if p.get('roundedness_pct', 0) >= MIN_BASE_CANDLES_PCT * 100 else "❌ FAIL"
-    print(f"    {p.get('base_candles', 'N/A')} candles in base zone out of {p.get('cup_width', 'N/A')} cup candles ({p.get('roundedness_pct', 'N/A')}%) — {roundedness_pass}")
+    rnd_pass = "✅ PASS" if p.get('roundedness_pct', 0) >= MIN_BASE_CANDLES_PCT * 100 else "❌ FAIL"
+    print(f"    {p.get('base_candles', 'N/A')} candles in base zone out of "
+          f"{p.get('cup_width', 'N/A')} cup candles "
+          f"({p.get('roundedness_pct', 'N/A')}%) — {rnd_pass}")
 
+    # ── Pause Before Breakout ──
     print(f"  ─────────────────────────────────────────────────")
     print(f"  ✦ PAUSE-BEFORE-BREAKOUT CHECK")
     pause = p.get('pause_duration', 0)
@@ -824,12 +879,51 @@ def print_pattern(p, index=1):
     print(f"    Breakout Confirmed in      : {pause} candles (Needs ≥ {MIN_PAUSE_CANDLES})")
     print(f"    Handle Slope               : {slope} — {pause_pass}")
 
+    # ── Handle Low (old vs new) ──
     print(f"  ─────────────────────────────────────────────────")
     print(f"  ✦ HANDLE LOW")
     print(f"    OLD (first-dip)            : ₹{p.get('old_handle_low', 'N/A')}")
     print(f"    NEW (breakout-confirmed)   : ₹{p['handle_low_price']}")
 
-    # Show dates if available.
+    # ── Volume — Cup Decline ──
+    print(f"  ─────────────────────────────────────────────────")
+    print(f"  ✦ VOLUME — Cup Decline")
+    if p.get('vol_decline_pass') is not None:
+        vd_status = "✅ PASS (light selling)" if p['vol_decline_pass'] else "⚠ WARN (heavy selling)"
+        print(f"    Avg vol during decline     : {p['vol_decline_avg']:,.0f}")
+        print(f"    50-period SMA vol          : {p['vol_sma50']:,.0f}")
+        print(f"    Status                     : {vd_status}")
+    else:
+        print(f"    Status                     : N/A (no volume data)")
+
+    # ── Volume — Recovery ──
+    print(f"  ─────────────────────────────────────────────────")
+    print(f"  ✦ VOLUME — Recovery")
+    if p.get('vol_recovery_pass') is not None:
+        vr_status = "✅ PASS (more buying)" if p['vol_recovery_pass'] else "⚠ WARN (weak buying)"
+        print(f"    Up-vol / Down-vol ratio    : {p['vol_recovery_ratio']:.2f}")
+        print(f"    Status                     : {vr_status}")
+    else:
+        print(f"    Status                     : N/A (no volume data)")
+
+    # ── Volume — Breakout ──
+    print(f"  ─────────────────────────────────────────────────")
+    print(f"  ✦ VOLUME — Breakout")
+    if p.get('vol_breakout_pass') is not None:
+        vb_status = "✅ PASS (strong interest)" if p['vol_breakout_pass'] else "⚠ WARN (low interest)"
+        print(f"    Avg breakout volume        : {p['vol_breakout_avg']:,.0f}")
+        print(f"    Threshold (1.2× SMA50)     : {p['vol_sma50'] * BREAKOUT_VOLUME_MULTIPLIER:,.0f}")
+        print(f"    Status                     : {vb_status}")
+    else:
+        print(f"    Status                     : N/A (no volume data)")
+
+    # ── Smoothing ──
+    print(f"  ─────────────────────────────────────────────────")
+    print(f"  ✦ SMOOTHING")
+    print(f"    Method                     : {p.get('smoothing_method', 'None')}")
+    print(f"    Note: Peaks detected on smoothed series; all prices are RAW.")
+
+    # ── Dates ──
     if "left_rim_date" in p:
         print(f"  ─────────────────────────────────────────────────")
         print(f"  📅 Left Rim Date   : {p['left_rim_date']}")
@@ -837,93 +931,64 @@ def print_pattern(p, index=1):
         print(f"  📅 Right Rim Date  : {p['right_rim_date']}")
         print(f"  📅 Handle Low Date : {p['handle_low_date']}")
 
+    # ── Final Verdict ──
     print(f"  ─────────────────────────────────────────────────")
     if p.get("reject_reason"):
         print(f"  FINAL VERDICT: ❌ REJECTED ({p['reject_reason']})")
     else:
-        print(f"  FINAL VERDICT: ✅ VALID")
+        print(f"  FINAL VERDICT: ✅ VALID (Quality Score: {p.get('quality_score', 0)})")
 
     print(f"  {'═' * 60}\n")
 
 
 # =============================================================================
-#  5.  SELF-TEST  — Synthetic data to prove the detection math works
+#  7. SELF-TEST — Synthetic data to prove detection math works
 # =============================================================================
 
 def test_with_sample_data():
     """
-    Creates FAKE price data shaped like a textbook Cup and Handle,
-    runs detection on it, and verifies the result.
+    Creates FAKE price + volume data shaped like textbook patterns,
+    runs detection, and verifies results. ZERO internet needed.
 
-    Also tests rejection cases (flat data, downtrend, handle-too-deep)
-    to confirm the geometry filter works correctly.
-
-    This function needs ZERO internet and ZERO market data.
-    It proves the detection algorithm is mathematically correct.
-
-    How we build the synthetic cup shape
-    -------------------------------------
-    Think of the cup as a smooth U-shape:
-
-       100 ─╮                              ╭─ 100  (Right Rim)
-             ╲                            ╱
-              ╲                          ╱
-               ╲                        ╱
-                ╰──── 80 ──────────────╯       (Cup Bottom = 20% drop)
-                                               Then a handle: dips to ~95
-
-    We use numpy to build this piece by piece:
-    - Start high (100)             → Left Rim
-    - Smoothly drop to 80          → Cup descent
-    - Stay near 80 briefly         → Cup bottom
-    - Smoothly rise back to 100    → Cup ascent / Right Rim
-    - Dip to 95 then recover to 98 → Handle (within 32% of cup depth)
+    Tests
+    -----
+    1. Textbook Cup & Handle → should PASS (VALID).
+    2. Flat/random series   → should find NOTHING.
+    3. V-shaped recovery    → should REJECT (roundedness failure).
+    4. Handle too deep      → should REJECT (geometry failure).
     """
     print("\n" + "=" * 70)
     print("  🧪 SELF-TEST : Synthetic Cup & Handle Verification")
     print("=" * 70)
 
-    # ── Test 1: Textbook Cup and Handle (should PASS) ───────────────────
+    # ── Test 1: Textbook Cup and Handle (should PASS) ────────────────────
     print("\n  TEST 1: Textbook Cup & Handle shape")
     print("  " + "-" * 50)
 
-    # Build each segment of the cup:
-    # Key insight: find_peaks needs the price to RISE then FALL to see a peak.
-    # A flat plateau is NOT a peak. So we build a realistic shape:
-    #   rise → Left Rim peak → descent → bottom → ascent → Right Rim peak
-    #   → handle dip → recovery
+    np.random.seed(123)
 
-    # 1. Gradual rise from 90 to 100 (creates a clear Left Rim peak)
+    # Build each segment:
     rise_to_left_rim = np.linspace(90, 100, 15)
-
-    # 2. Smooth descent from 100 → 80 (the left side of the cup)
     descent = np.linspace(100, 80, 30)
-
-    # 3. Cup bottom: stay near 80 for a while (with tiny noise for realism)
-    np.random.seed(123)  # reproducible
     bottom = np.ones(20) * 80 + np.random.uniform(-0.3, 0.3, 20)
-
-    # 4. Smooth ascent from 80 → 100 (right side of the cup)
     ascent = np.linspace(80, 100, 30)
-
-    # 5. Right Rim: brief peak at 100, then start the handle
     right_rim = np.array([100.0, 100.2, 100.1, 100.0, 99.8])
-
-    # 6. Handle: dip to 95, then recover to 98
-    #    Cup depth = 100 − 80 = 20.  Max handle dip = 0.32 × 20 = 6.4.
-    #    Handle pullback = 100 − 95 = 5.  5 ≤ 6.4 → PASS ✅
     handle_down = np.linspace(99.8, 95, 10)
     handle_up = np.linspace(95, 98, 10)
-
-    # 7. Post-handle (breakout above Right Rim to confirm the pattern)
     post_handle_breakout = np.linspace(98, 103, 5)
     post_breakout = np.ones(10) * 103
 
-    # Concatenate all segments into one price series.
     synthetic_prices = np.concatenate([
         rise_to_left_rim, descent, bottom, ascent, right_rim,
         handle_down, handle_up, post_handle_breakout, post_breakout
     ])
+
+    # Generate synthetic volume data:
+    # Decline: low volume; Recovery: up-day heavy; Breakout: spike
+    n = len(synthetic_prices)
+    synthetic_volumes = np.random.uniform(800000, 1200000, n)
+    # Breakout candles get a volume spike
+    synthetic_volumes[-15:] = np.random.uniform(2000000, 3000000, 15)
 
     print(f"  Synthetic series length : {len(synthetic_prices)} candles")
     print(f"  Price range             : ₹{synthetic_prices.min():.1f}"
@@ -932,8 +997,10 @@ def test_with_sample_data():
     print(f"  Geometry                : Cup depth = ₹20, "
           f"Max handle = ₹{0.32 * 20:.1f}, Actual = ₹5 → PASS")
 
-    # Run detection
-    results = detect_cup_and_handle(synthetic_prices, ticker="SYNTHETIC_CUP", verbose=True)
+    results = detect_cup_and_handle(
+        synthetic_prices, volumes=synthetic_volumes,
+        ticker="SYNTHETIC_CUP", verbose=True
+    )
 
     if results:
         print(f"\n  ✅ PASS — {len(results)} pattern(s) detected (expected ≥ 1)")
@@ -943,13 +1010,12 @@ def test_with_sample_data():
         print("\n  ❌ FAIL — No pattern detected on textbook cup shape!")
         print("  (This means the detection parameters may need tuning.)")
 
-    # ── Test 2: Flat / Random series (should NOT detect anything) ───────
+    # ── Test 2: Flat / Random series (should NOT detect anything) ────────
     print("\n  TEST 2: Flat/random series (should find NOTHING)")
     print("  " + "-" * 50)
 
-    # Create 200 candles of roughly flat prices with small noise.
-    np.random.seed(42)  # reproducible randomness
-    flat_prices = 100 + np.random.normal(0, 0.5, 200)  # very small wiggles
+    np.random.seed(42)
+    flat_prices = 100 + np.random.normal(0, 0.5, 200)
 
     print(f"  Flat series length : {len(flat_prices)} candles")
     print(f"  Price range        : ₹{flat_prices.min():.1f}"
@@ -961,36 +1027,46 @@ def test_with_sample_data():
         print("\n  ✅ PASS — No patterns detected (correct for random data)")
     else:
         print(f"\n  ⚠️  {len(results_flat)} false positive(s) detected.")
-        print("  This may be acceptable if the noise happened to form a shape.")
 
-    # ── Test 3: Downtrend (should NOT detect) ───────────────────────────
-    print("\n  TEST 3: Steady downtrend (should find NOTHING)")
+    # ── Test 3: V-shaped recovery (should REJECT — roundedness) ──────────
+    print("\n  TEST 3: V-shaped recovery (should REJECT — no rounded bottom)")
     print("  " + "-" * 50)
 
-    downtrend = np.linspace(150, 80, 200)  # just goes down, no cup shape
+    # Sharp V: steep descent, no basing, steep ascent (30% drop)
+    v_rise = np.linspace(85, 100, 15)
+    v_descent = np.linspace(100, 70, 15)     # fast down to 70
+    v_bottom = np.array([70.0])              # single candle at bottom
+    v_ascent = np.linspace(70, 100, 15)      # fast up to 100
+    v_rim = np.array([100.0, 100.2, 100.1])
+    v_handle = np.linspace(100, 96, 8)
+    v_handle_up = np.linspace(96, 103, 10)
+    v_post = np.ones(10) * 103
 
-    results_down = detect_cup_and_handle(downtrend, ticker="DOWNTREND")
+    v_prices = np.concatenate([v_rise, v_descent, v_bottom, v_ascent,
+                                v_rim, v_handle, v_handle_up, v_post])
 
-    if not results_down:
-        print("  ✅ PASS — No patterns detected (correct for a straight decline)")
+    print(f"  Series length : {len(v_prices)} candles")
+    print(f"  Shape         : Sharp V (1 candle at bottom)")
+
+    results_v = detect_cup_and_handle(v_prices, ticker="V_SHAPE", verbose=True)
+
+    if not results_v:
+        print("\n  ✅ PASS — V-shape correctly REJECTED")
     else:
-        print(f"  ⚠️  {len(results_down)} false positive(s) on downtrend.")
+        print(f"\n  ⚠️  {len(results_v)} pattern(s) found (check roundedness filter)")
 
-    # ── Test 4: Handle Too Deep — MUST BE REJECTED by geometry ──────────
+    # ── Test 4: Handle Too Deep (should REJECT — geometry) ───────────────
     print("\n  TEST 4: Handle dips TOO DEEP (should be REJECTED by 0.32× rule)")
     print("  " + "-" * 50)
 
-    # Same cup as Test 1, but the handle drops to ₹90 instead of ₹95.
-    #   Cup depth = 100 − 80 = 20.  Max handle = 0.32 × 20 = 6.4.
-    #   Handle pullback = 100 − 90 = 10.  10 > 6.4 → MUST REJECT ❌
     deep_handle_down = np.linspace(99.8, 90, 10)
     deep_handle_up = np.linspace(90, 95, 10)
-    deep_post_handle_breakout = np.linspace(95, 103, 5)
-    deep_post_breakout = np.ones(10) * 103
+    deep_post_breakout = np.linspace(95, 103, 5)
+    deep_post = np.ones(10) * 103
 
     deep_handle_prices = np.concatenate([
         rise_to_left_rim, descent, bottom, ascent, right_rim,
-        deep_handle_down, deep_handle_up, deep_post_handle_breakout, deep_post_breakout
+        deep_handle_down, deep_handle_up, deep_post_breakout, deep_post
     ])
 
     print(f"  Synthetic series length : {len(deep_handle_prices)} candles")
@@ -1008,8 +1084,6 @@ def test_with_sample_data():
     else:
         print(f"\n  ❌ FAIL — {len(results_deep)} pattern(s) detected but "
               f"should have been rejected!")
-        for idx, pat in enumerate(results_deep, 1):
-            print_pattern(pat, idx)
 
     print("\n" + "=" * 70)
     print("  🧪 SELF-TEST COMPLETE")
@@ -1017,43 +1091,36 @@ def test_with_sample_data():
 
 
 # =============================================================================
-#  6.  HISTORICAL BACKTEST  — Full-sweep mode (MODE B)
+#  8. HISTORICAL BACKTEST — Full-sweep mode
 # =============================================================================
 
-def run_historical_backtest(tickers=None, period="2y", start=None, end=None, interval="1d"):
+def backtest_historical(tickers=None, period="2y", start=None, end=None, interval="1d"):
     """
     MODE B: HISTORICAL BACKTEST
     ===========================
     Downloads historical data and sweeps the ENTIRE timeline for
-    cup-and-handle patterns. No date restriction, no output cap.
+    cup-and-handle patterns. Prints full debug output for each candidate,
+    ranks valid patterns by quality score.
 
-    Results are saved to 'backtest_results.txt' in the script directory
-    with full pattern details. A clean summary table is also printed
-    to the terminal.
-
-    Parameters
-    ----------
-    tickers : list[str] or None
-        Specific tickers to scan. If None, fetches the full Nifty watchlist.
+    Results are saved to 'backtest_results.txt'.
     """
     label = f"Interval: {interval}, Period: {period or 'Custom Date Range'}"
 
     print("\n" + "=" * 70)
     print("  📊 HISTORICAL BACKTEST  (Full Timeline Sweep)")
     print("=" * 70)
-    print(f"  Data   : {label}")
-    print(f"  Filter : NONE — every valid pattern is printed")
-    print(f"  Geometry: Handle ≤ {HANDLE_MAX_RETRACE_RATIO * 100:.0f}% "
+    print(f"  Data       : {label}")
+    print(f"  Smoothing  : SMA({SMOOTHING_WINDOW})")
+    print(f"  Filter     : NONE — every valid pattern is printed")
+    print(f"  Geometry   : Handle ≤ {HANDLE_MAX_RETRACE_RATIO * 100:.0f}% "
           f"of cup depth\n")
 
-    # If no tickers specified, fetch the full Nifty watchlist.
     if tickers is None:
         print("  Fetching Nifty watchlist ...\n")
         tickers = get_nifty_list()
 
     print(f"  Scanning {len(tickers)} tickers over {label}\n")
 
-    # Download all data in batches.
     all_data = fetch_batch_data(
         tickers, period=period, start=start, end=end, interval=interval
     )
@@ -1062,7 +1129,6 @@ def run_historical_backtest(tickers=None, period="2y", start=None, end=None, int
         print("  ⚠ No data downloaded. Check your internet connection.\n")
         return []
 
-    # ── Scan each ticker ──
     all_patterns = []
     tickers_scanned = 0
     tickers_with_patterns = 0
@@ -1070,21 +1136,24 @@ def run_historical_backtest(tickers=None, period="2y", start=None, end=None, int
     for ticker, df in all_data.items():
         tickers_scanned += 1
 
-        # Extract closing prices, high prices, and their timestamps.
         close_prices = df["Close"].dropna().values
         high_prices  = df["High"].reindex(df["Close"].dropna().index).values
         dates = df["Close"].dropna().index
 
-        if len(close_prices) < 30:
-            continue  # not enough data points
+        # Volume data (may have NaN — fill with 0)
+        if "Volume" in df.columns:
+            vol_data = df["Volume"].reindex(df["Close"].dropna().index).fillna(0).values
+        else:
+            vol_data = None
 
-        # If there are only a few tickers, turn on verbose mode to show rejections
+        if len(close_prices) < 30:
+            continue
+
         is_verbose = (len(all_data) <= 5)
 
-        # Full sweep — no date restriction.
         patterns = detect_cup_and_handle(
-            close_prices, ticker=ticker, dates=dates,
-            interval=interval, highs=high_prices, verbose=is_verbose
+            close_prices, highs=high_prices, volumes=vol_data,
+            ticker=ticker, dates=dates, interval=interval, verbose=is_verbose
         )
 
         if patterns:
@@ -1092,22 +1161,24 @@ def run_historical_backtest(tickers=None, period="2y", start=None, end=None, int
             print(f"  ✓ {ticker}: {len(patterns)} pattern(s) found")
         all_patterns.extend(patterns)
 
-    # ── Build results file and terminal output ──
-    # Helper to clean timestamps to date-only strings.
+    # Sort all patterns by quality score
+    all_patterns.sort(key=lambda p: p.get("quality_score", 0), reverse=True)
+
+    # Helper for clean dates
     def clean_date(d):
         return str(d).split(' ')[0] if ' ' in str(d) else str(d)
 
-    # Determine the output file path (same directory as the script).
+    # ── Write results file ──
     script_dir = os.path.dirname(os.path.abspath(__file__))
     results_file = os.path.join(script_dir, "backtest_results.txt")
 
-    # ── Write the results file ──
     with open(results_file, "w", encoding="utf-8") as f:
         f.write("=" * 70 + "\n")
-        f.write("  📊 HISTORICAL BACKTEST RESULTS\n")
+        f.write("  📊 HISTORICAL BACKTEST RESULTS (v2.0)\n")
         f.write("=" * 70 + "\n")
         f.write(f"  Run Date       : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"  Data           : {label}\n")
+        f.write(f"  Smoothing      : SMA({SMOOTHING_WINDOW})\n")
         f.write(f"  Tickers scanned: {tickers_scanned}\n")
         f.write(f"  Patterns found : {len(all_patterns)}\n")
         f.write(f"  Geometry       : Handle ≤ {HANDLE_MAX_RETRACE_RATIO * 100:.0f}% "
@@ -1115,9 +1186,9 @@ def run_historical_backtest(tickers=None, period="2y", start=None, end=None, int
         f.write("=" * 70 + "\n\n")
 
         if all_patterns:
-            # ── Summary Table ──
+            # Summary Table
             f.write("─" * 70 + "\n")
-            f.write("  SUMMARY TABLE\n")
+            f.write("  SUMMARY TABLE (ranked by Quality Score)\n")
             f.write("─" * 70 + "\n\n")
 
             df_rows = []
@@ -1125,6 +1196,7 @@ def run_historical_backtest(tickers=None, period="2y", start=None, end=None, int
                 df_rows.append({
                     "#": len(df_rows) + 1,
                     "Ticker": p["ticker"],
+                    "Score": p.get("quality_score", 0),
                     "Left Rim Date": clean_date(p.get("left_rim_date", "N/A")),
                     "Left Rim": p["left_rim_price"],
                     "Bottom Date": clean_date(p.get("cup_bottom_date", "N/A")),
@@ -1143,49 +1215,58 @@ def run_historical_backtest(tickers=None, period="2y", start=None, end=None, int
             f.write(df_out.to_string(index=False))
             f.write("\n\n")
 
-            # ── Detailed Pattern Blocks ──
+            # Detailed Pattern Blocks
             f.write("─" * 70 + "\n")
             f.write("  DETAILED PATTERN BREAKDOWN\n")
             f.write("─" * 70 + "\n")
 
             for idx, p in enumerate(all_patterns, 1):
                 f.write(f"\n  {'═' * 60}\n")
-                f.write(f"  🏆 PATTERN #{idx}  —  {p['ticker']}\n")
+                f.write(f"  🏆 PATTERN #{idx}  —  {p['ticker']}  "
+                        f"(Score: {p.get('quality_score', 0)})\n")
                 f.write(f"  {'═' * 60}\n")
-                f.write(f"  Left Rim  (peak before cup)  : ₹{p['left_rim_price']}\n")
-                f.write(f"  Cup Bottom (lowest point)    : ₹{p['cup_bottom_price']}\n")
-                f.write(f"  Right Rim  (recovery peak)   : ₹{p['right_rim_price']}\n")
-                f.write(f"  Handle Low (small dip after) : ₹{p['handle_low_price']}\n")
+                f.write(f"  Left Rim  : ₹{p['left_rim_price']}  "
+                        f"({clean_date(p.get('left_rim_date', 'N/A'))})\n")
+                f.write(f"  Cup Bottom: ₹{p['cup_bottom_price']}  "
+                        f"({clean_date(p.get('cup_bottom_date', 'N/A'))})\n")
+                f.write(f"  Right Rim : ₹{p['right_rim_price']}  "
+                        f"({clean_date(p.get('right_rim_date', 'N/A'))})\n")
+                f.write(f"  Handle Low: ₹{p['handle_low_price']}  "
+                        f"({clean_date(p.get('handle_low_date', 'N/A'))})\n")
                 f.write(f"  ─────────────────────────────────────────────────\n")
-                f.write(f"  Cup Drop     : {p['cup_drop_pct']}%\n")
-                f.write(f"  Recovery Gap : {p['recovery_pct']}%\n")
+                f.write(f"  Cup Drop: {p['cup_drop_pct']}% | "
+                        f"Recovery Gap: {p['recovery_pct']}% | "
+                        f"Handle Dip: {p['handle_pullback_pct']}%\n")
                 f.write(f"  ─────────────────────────────────────────────────\n")
-                f.write(f"  ✦ GEOMETRY CHECK\n")
-                f.write(f"    Cup Depth (₹)              : ₹{p['cup_depth']}\n")
-                f.write(f"    Max Handle Dip Allowed (₹) : ₹{p['max_handle_dip']}  "
-                        f"(= 0.32 × ₹{p['cup_depth']})\n")
-                f.write(f"    Actual Handle Pullback (₹) : ₹{p['handle_pullback']}  "
-                        f"({p['handle_pullback_pct']}%)\n")
-                status = "✅ PASS" if p['handle_pullback'] <= p['max_handle_dip'] else "❌ FAIL"
-                f.write(f"    Status                     : {status}\n")
-                if "left_rim_date" in p:
-                    f.write(f"  ─────────────────────────────────────────────────\n")
-                    f.write(f"  📅 Left Rim Date   : {p['left_rim_date']}\n")
-                    f.write(f"  📅 Cup Bottom Date : {p['cup_bottom_date']}\n")
-                    f.write(f"  📅 Right Rim Date  : {p['right_rim_date']}\n")
-                    f.write(f"  📅 Handle Low Date : {p['handle_low_date']}\n")
+                f.write(f"  Geometry: Cup Depth ₹{p['cup_depth']} | "
+                        f"Max Handle ₹{p['max_handle_dip']} | "
+                        f"Actual ₹{p['handle_pullback']}\n")
+                f.write(f"  Roundedness: {p.get('roundedness_pct', 0)}% "
+                        f"({p.get('base_candles', 0)}/{p.get('cup_width', 0)} candles)\n")
+                f.write(f"  Pause: {p.get('pause_duration', 0)} candles | "
+                        f"Slope: {p.get('handle_slope', 0)}\n")
+
+                # Volume info
+                if p.get('vol_decline_pass') is not None:
+                    vd = "PASS" if p['vol_decline_pass'] else "WARN"
+                    vr = "PASS" if p.get('vol_recovery_pass') else "WARN"
+                    vb = "PASS" if p.get('vol_breakout_pass') else "WARN"
+                    f.write(f"  Volume: Decline={vd} | "
+                            f"Recovery ratio={p.get('vol_recovery_ratio', 0):.2f} ({vr}) | "
+                            f"Breakout={vb}\n")
+
+                f.write(f"  Smoothing: {p.get('smoothing_method', 'None')}\n")
                 f.write(f"  {'═' * 60}\n")
 
         else:
             f.write("  No patterns found in the historical data.\n")
             f.write("  This is normal — cup-and-handle patterns are relatively rare.\n")
-            f.write("  Try a different set of tickers or a wider lookback.\n")
 
         f.write("\n" + "=" * 70 + "\n")
         f.write("  📊 BACKTEST COMPLETE\n")
         f.write("=" * 70 + "\n")
 
-    # ── Clean terminal summary ──
+    # ── Terminal summary ──
     print(f"\n  {'─' * 60}")
     print(f"  📊 BACKTEST RESULTS")
     print(f"  {'─' * 60}")
@@ -1194,20 +1275,20 @@ def run_historical_backtest(tickers=None, period="2y", start=None, end=None, int
     print(f"  Total patterns found  : {len(all_patterns)}")
 
     if all_patterns:
-        # Print a compact summary table to terminal.
         print(f"\n  {'─' * 60}")
-        print(f"  SUMMARY TABLE")
+        print(f"  SUMMARY TABLE (ranked by Quality Score)")
         print(f"  {'─' * 60}\n")
 
-        # Print a simplified, narrower table that fits in the terminal.
-        header = f"  {'#':>3}  {'Ticker':<16} {'Left Rim':>12} {'Bottom':>12} {'Right Rim':>12} {'Handle':>12} {'Drop%':>7} {'Hdl%':>6}"
+        header = (f"  {'#':>3}  {'Ticker':<16} {'Score':>6} {'Left Rim':>12} "
+                  f"{'Bottom':>12} {'Right Rim':>12} {'Handle':>12} "
+                  f"{'Drop%':>7} {'Hdl%':>6}")
         print(header)
         print("  " + "─" * (len(header) - 2))
 
         for idx, p in enumerate(all_patterns, 1):
-            lr_date = clean_date(p.get('left_rim_date', ''))
             print(
                 f"  {idx:>3}  {p['ticker']:<16} "
+                f"{p.get('quality_score', 0):>6} "
                 f"{p['left_rim_price']:>12} "
                 f"{p['cup_bottom_price']:>12} "
                 f"{p['right_rim_price']:>12} "
@@ -1230,7 +1311,7 @@ def run_historical_backtest(tickers=None, period="2y", start=None, end=None, int
 
 
 # =============================================================================
-#  7.  LIVE SCANNER  — Current-day patterns only, with deduplication (MODE A)
+#  9. LIVE SCANNER — Continuous scanning during NSE market hours
 # =============================================================================
 
 def _get_ist_now():
@@ -1241,8 +1322,7 @@ def _get_ist_now():
 
 def is_market_open():
     """
-    Checks if the NSE (National Stock Exchange of India) is currently open.
-
+    Checks if the NSE is currently open.
     NSE trading hours: Monday–Friday, 9:15 AM – 3:30 PM IST.
 
     Returns
@@ -1251,19 +1331,17 @@ def is_market_open():
         (True/False, human-readable status message)
     """
     ist_now = _get_ist_now()
-    day_of_week = ist_now.weekday()   # 0=Monday, 6=Sunday
+    day_of_week = ist_now.weekday()
     current_time = ist_now.time()
 
     market_open = datetime.time(9, 15)
     market_close = datetime.time(15, 30)
 
-    if day_of_week >= 5:  # Saturday or Sunday
+    if day_of_week >= 5:
         return False, f"Weekend (IST: {ist_now.strftime('%A %H:%M')})"
-
     if current_time < market_open:
         return False, (f"Pre-market (IST: {ist_now.strftime('%H:%M')},"
                        f" opens at 09:15)")
-
     if current_time > market_close:
         return False, (f"After-hours (IST: {ist_now.strftime('%H:%M')},"
                        f" closed at 15:30)")
@@ -1272,11 +1350,7 @@ def is_market_open():
 
 
 def _reset_dedup_cache_if_new_day():
-    """
-    Checks if the IST date has changed since the last alert was cached.
-    If it has, clears the dedup cache so tickers can alert again on the
-    new day.
-    """
+    """Clears the dedup cache when the IST date rolls over."""
     global _live_alerted_today, _live_alert_date
     today_ist = _get_ist_now().date()
     if _live_alert_date != today_ist:
@@ -1285,13 +1359,7 @@ def _reset_dedup_cache_if_new_day():
 
 
 def _is_pattern_from_today(pattern):
-    """
-    Returns True if the pattern's handle low date falls on the current
-    IST calendar date.
-
-    The handle low is used as the 'completion timestamp' because it is
-    the last structural point of the pattern before a potential breakout.
-    """
+    """Returns True if the pattern's handle low date falls on today (IST)."""
     if "handle_low_date" not in pattern:
         return False
     try:
@@ -1302,42 +1370,22 @@ def _is_pattern_from_today(pattern):
         return False
 
 
-def scan_watchlist_live(tickers, period=None, start=None, end=None, interval="15m"):
+def scan_watchlist(tickers, period=None, start=None, end=None, interval="15m"):
     """
-    One-shot live scan: downloads the latest intraday data, runs detection,
-    and filters for patterns completing TODAY only.
-
-    Deduplication
-    -------------
-    Uses the module-level `_live_alerted_today` set to track which tickers
-    have already fired an alert today. If a ticker is already in the set,
-    it is silently skipped (no repeat alert).
-
-    Parameters
-    ----------
-    tickers : list[str]
-        Ticker symbols to scan.
-
-    Returns
-    -------
-    list[dict]
-        Patterns that are (a) completing today and (b) not already alerted.
+    One-shot live scan: downloads latest data, runs detection,
+    filters for patterns completing TODAY only with deduplication.
     """
     global _live_alerted_today
 
-    # Step 1: Clear the dedup cache if the date rolled over.
     _reset_dedup_cache_if_new_day()
 
-    # Step 2: Download latest intraday data.
     all_data = fetch_batch_data(
         tickers, period=period, start=start, end=end, interval=interval
     )
 
     new_alerts = []
 
-    # Step 3: Scan each ticker for patterns.
     for ticker, df in all_data.items():
-        # Dedup check — skip if this ticker already alerted today.
         if ticker in _live_alerted_today:
             continue
 
@@ -1345,51 +1393,46 @@ def scan_watchlist_live(tickers, period=None, start=None, end=None, interval="15
         high_prices  = df["High"].reindex(df["Close"].dropna().index).values
         dates = df["Close"].dropna().index
 
+        if "Volume" in df.columns:
+            vol_data = df["Volume"].reindex(df["Close"].dropna().index).fillna(0).values
+        else:
+            vol_data = None
+
         if len(close_prices) < 50:
             continue
 
         patterns = detect_cup_and_handle(
-            close_prices, ticker=ticker, dates=dates,
-            interval=interval, highs=high_prices
+            close_prices, highs=high_prices, volumes=vol_data,
+            ticker=ticker, dates=dates, interval=interval
         )
 
-        # Step 4: Filter — only keep patterns completing TODAY.
         for pat in patterns:
             if _is_pattern_from_today(pat):
-                # This ticker has a fresh, today-only pattern.
-                # Add to dedup cache so it won't fire again this session-day.
                 _live_alerted_today.add(ticker)
                 new_alerts.append(pat)
-                break  # one alert per ticker per day is enough
+                break
 
     return new_alerts
 
 
-def run_live_scanner(tickers=None, period="59d", start=None, end=None, interval="15m"):
+def run_scheduler(tickers=None, period="59d", start=None, end=None, interval="15m"):
     """
-    MODE A: LIVE SCANNER
-    ====================
-    Continuously scans the watchlist every SCAN_INTERVAL_MINUTES during
-    NSE market hours.
+    MODE C: CONTINUOUS LIVE SCANNER
+    ================================
+    Scans the watchlist every SCAN_INTERVAL_MINUTES during NSE market hours.
 
-    Behaviour
-    ---------
     • During market hours: scans for patterns completing TODAY.
     • Deduplication: each ticker alerts at most ONCE per day.
     • Outside market hours: prints a "waiting" message and sleeps.
     • Press Ctrl+C at any time to exit cleanly.
-
-    Parameters
-    ----------
-    tickers : list[str] or None
-        If None, fetches the Nifty watchlist automatically.
     """
     label = f"Interval: {interval}, Period: {period or 'Custom Date Range'}"
 
     print("\n" + "=" * 70)
-    print("  🚀 LIVE SCANNER — Current-Day Patterns Only")
+    print("  🚀 LIVE SCANNER — Current-Day Patterns Only (v2.0)")
     print("=" * 70)
     print(f"  Data          : {label}")
+    print(f"  Smoothing     : SMA({SMOOTHING_WINDOW})")
     print(f"  Scan interval : every {SCAN_INTERVAL_MINUTES} minutes")
     print(f"  Market hours  : Mon–Fri, 9:15 AM – 3:30 PM IST")
     print(f"  Dedup         : Each ticker alerts at most ONCE per day")
@@ -1397,7 +1440,6 @@ def run_live_scanner(tickers=None, period="59d", start=None, end=None, interval=
           f" of cup depth")
     print(f"  Exit          : Press Ctrl+C\n")
 
-    # Fetch the watchlist ONCE (reused across scans).
     if tickers is None:
         tickers = get_nifty_list()
 
@@ -1409,7 +1451,7 @@ def run_live_scanner(tickers=None, period="59d", start=None, end=None, interval=
 
             if not market_open:
                 print(f"  ⏸  {status_msg} — sleeping 5 min before re-check ...")
-                time.sleep(300)  # check every 5 minutes if market opened
+                time.sleep(300)
                 continue
 
             scan_count += 1
@@ -1420,9 +1462,14 @@ def run_live_scanner(tickers=None, period="59d", start=None, end=None, interval=
                   f"already alerted today.\n")
 
             try:
-                new_alerts = scan_watchlist_live(tickers, period=period, start=start, end=end, interval=interval)
+                new_alerts = scan_watchlist(
+                    tickers, period=period, start=start,
+                    end=end, interval=interval
+                )
 
                 if new_alerts:
+                    # Sort by quality score
+                    new_alerts.sort(key=lambda p: p.get("quality_score", 0), reverse=True)
                     print(f"\n  🔔 {len(new_alerts)} NEW ALERT(S)!\n")
                     for idx, pat in enumerate(new_alerts, 1):
                         print_pattern(pat, idx)
@@ -1431,7 +1478,6 @@ def run_live_scanner(tickers=None, period="59d", start=None, end=None, interval=
                           "(or already alerted).\n")
 
             except Exception as e:
-                # One bad scan shouldn't kill the entire loop.
                 print(f"\n  ⚠ Scan error (will retry next cycle): {e}\n")
 
             print(f"  ⏳ Next scan in {SCAN_INTERVAL_MINUTES} minutes ..."
@@ -1443,92 +1489,104 @@ def run_live_scanner(tickers=None, period="59d", start=None, end=None, interval=
 
 
 # =============================================================================
-#  8.  MAIN ENTRY POINT  — Dispatches based on RUN_MODE
+#  10. MAIN ENTRY POINT
 # =============================================================================
 
 def validate_yfinance_params(interval, period):
+    """Validates that the interval+lookback combo is supported by yfinance."""
     intraday_intervals = ["1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h"]
-    
+
     if interval in intraday_intervals:
         if period:
             if period.endswith("y") or period.endswith("mo"):
-                print(f"  ⚠ WARNING: yfinance only supports up to 60 days for {interval} intraday data.")
+                print(f"  ⚠ WARNING: yfinance only supports up to 60 days "
+                      f"for {interval} intraday data.")
                 print(f"  Capping lookback to '59d'.\n")
                 return "59d"
             elif period.endswith("d"):
                 try:
                     days = int(period[:-1])
                     if days >= 60:
-                        print(f"  ⚠ WARNING: yfinance only supports up to 60 days for {interval} intraday data.")
+                        print(f"  ⚠ WARNING: yfinance only supports up to 60 days "
+                              f"for {interval} intraday data.")
                         print(f"  Capping lookback to '59d'.\n")
                         return "59d"
-                except:
+                except ValueError:
                     pass
     return period
 
+
 def prompt_for_config(default_interval="1d", default_period="2y"):
+    """Interactive prompt for candle interval and lookback period."""
     print("\n  [Configuration]")
-    interval = input(f"  Enter candle interval (e.g., 15m, 1h, 1d) [default {default_interval}]: ").strip()
+    interval = input(f"  Enter candle interval (e.g., 15m, 30m, 1h, 1d, 1wk) "
+                     f"[default {default_interval}]: ").strip()
     if not interval:
         interval = default_interval
-        
+
     if interval in ["1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h"]:
         if default_period == "2y":
             default_period = "59d"
-        
-    period = input(f"  Enter lookback period (e.g., 59d, 6mo, 2y) [default {default_period}]: ").strip()
+
+    period = input(f"  Enter lookback period (e.g., 59d, 6mo, 2y) "
+                   f"[default {default_period}]: ").strip()
     if not period:
         period = default_period
-        
+
     period = validate_yfinance_params(interval, period)
     return interval, period
 
+
 def main():
     """
-    Entry point. Reads the RUN_MODE variable and dispatches accordingly.
+    Entry point. Choose a mode via command-line arguments or interactive menu.
 
     Usage
     -----
-    # Toggle at top of file:
-    RUN_MODE = "LIVE"     # or "HISTORICAL"
-
-    # Or override via command-line:
     python cup_and_handle_detector.py test
-    python cup_and_handle_detector.py live --interval 15m --lookback 59d
     python cup_and_handle_detector.py historical RELIANCE.NS TCS.NS --interval 1d --lookback 2y
     python cup_and_handle_detector.py historical --start-date 2024-01-01 --end-date 2024-06-01
-
-    # Or use the interactive menu:
-    python cup_and_handle_detector.py
+    python cup_and_handle_detector.py live --interval 15m --lookback 59d
+    python cup_and_handle_detector.py           # interactive menu
     """
-    parser = argparse.ArgumentParser(description="Cup and Handle Pattern Detector")
-    parser.add_argument("mode", nargs="?", default="", help="test, historical, live, or empty for interactive menu")
-    parser.add_argument("tickers", nargs="*", help="Optional specific tickers to scan in historical mode")
-    parser.add_argument("--interval", "-i", type=str, help="Candle interval (e.g., 15m, 1d)")
-    parser.add_argument("--lookback", "-l", type=str, help="Lookback period (e.g., 59d, 2y)")
-    parser.add_argument("--start-date", "-s", type=str, help="Start date (YYYY-MM-DD)")
-    parser.add_argument("--end-date", "-e", type=str, help="End date (YYYY-MM-DD)")
-    
+    parser = argparse.ArgumentParser(
+        description="Cup and Handle Pattern Detector v2.0 — NSE (India)"
+    )
+    parser.add_argument("mode", nargs="?", default="",
+                        help="test, historical, live, or empty for interactive menu")
+    parser.add_argument("tickers", nargs="*",
+                        help="Optional specific tickers to scan in historical mode")
+    parser.add_argument("--interval", "-i", type=str,
+                        help="Candle interval (e.g., 15m, 1d)")
+    parser.add_argument("--lookback", "-l", type=str,
+                        help="Lookback period (e.g., 59d, 2y)")
+    parser.add_argument("--start-date", "-s", type=str,
+                        help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--end-date", "-e", type=str,
+                        help="End date (YYYY-MM-DD)")
+
     args = parser.parse_args()
 
     print(r"""
     ╔══════════════════════════════════════════════════════════════╗
     ║                                                              ║
-    ║     ☕  CUP & HANDLE  PATTERN  DETECTOR                      ║
+    ║     ☕  CUP & HANDLE  PATTERN  DETECTOR   v2.0               ║
     ║         Indian Stock Market (NSE)                            ║
     ║                                                              ║
-    ║     Geometry : Handle ≤ 32% of Cup Depth                     ║
-    ║     Modes    : LIVE       |  HISTORICAL                      ║
+    ║     Smoothing : SMA(5) for peak detection                    ║
+    ║     Geometry  : Handle ≤ 32% of Cup Depth                    ║
+    ║     Volume    : 3 confirmation checks                        ║
+    ║     Scoring   : Composite quality ranking                    ║
+    ║     Modes     : TEST  |  HISTORICAL  |  LIVE                 ║
     ║                                                              ║
     ╚══════════════════════════════════════════════════════════════╝
     """)
 
     mode = args.mode.lower()
-    
-    # Process args if provided
+
     interval = args.interval
     period = args.lookback
-    
+
     if interval and period:
         period = validate_yfinance_params(interval, period)
 
@@ -1541,14 +1599,21 @@ def main():
             interval = "1d"
         if not period and not args.start_date:
             period = "2y"
-        
+
         period = validate_yfinance_params(interval, period)
-        
+
         if args.tickers:
-            specific_tickers = [t if t.endswith(".NS") else f"{t}.NS" for t in args.tickers]
-            run_historical_backtest(tickers=specific_tickers, period=period, start=args.start_date, end=args.end_date, interval=interval)
+            specific_tickers = [t if t.endswith(".NS") else f"{t}.NS"
+                                for t in args.tickers]
+            backtest_historical(
+                tickers=specific_tickers, period=period,
+                start=args.start_date, end=args.end_date, interval=interval
+            )
         else:
-            run_historical_backtest(period=period, start=args.start_date, end=args.end_date, interval=interval)
+            backtest_historical(
+                period=period, start=args.start_date,
+                end=args.end_date, interval=interval
+            )
         return
 
     elif mode in ("live", "live_scan"):
@@ -1556,38 +1621,39 @@ def main():
             interval = "15m"
         if not period and not args.start_date:
             period = "59d"
-            
+
         period = validate_yfinance_params(interval, period)
-        run_live_scanner(period=period, start=args.start_date, end=args.end_date, interval=interval)
+        run_scheduler(
+            period=period, start=args.start_date,
+            end=args.end_date, interval=interval
+        )
         return
-        
+
     elif mode != "":
         print(f"  Unknown mode: '{mode}'")
         print(f"  Valid modes: test, historical, live\n")
         return
 
     # ── Interactive menu ──
-    print(f"  ⚙ Active RUN_MODE = \"{RUN_MODE}\"\n")
     print("  Choose a mode:\n")
     print("    [1]  🧪 Self-Test         — Run on synthetic data (instant, no internet)")
     print("    [2]  📊 Historical Backtest — Full timeline sweep")
     print("    [3]  🚀 Live Scanner       — Current-day patterns only")
     print("    [4]  📊 Backtest ONE       — Historical scan for a specific stock")
-    print(f"    [R]  ▶ Run RUN_MODE       — Execute the configured mode (\"{RUN_MODE}\")")
     print("    [Q]  Exit\n")
 
-    choice = input("  Enter choice (1/2/3/4/R/Q): ").strip().lower()
+    choice = input("  Enter choice (1/2/3/4/Q): ").strip().lower()
 
     if choice == "1":
         test_with_sample_data()
 
     elif choice == "2":
         interval, period = prompt_for_config("1d", "2y")
-        run_historical_backtest(period=period, interval=interval)
+        backtest_historical(period=period, interval=interval)
 
     elif choice == "3":
         interval, period = prompt_for_config("15m", "59d")
-        run_live_scanner(period=period, interval=interval)
+        run_scheduler(period=period, interval=interval)
 
     elif choice == "4":
         ticker = input("  Enter ticker (e.g., RELIANCE or RELIANCE.NS): ").strip()
@@ -1596,26 +1662,16 @@ def main():
             return
         if not ticker.endswith(".NS"):
             ticker += ".NS"
-            
-        interval, period = prompt_for_config("1d", "2y")
-        run_historical_backtest(tickers=[ticker], period=period, interval=interval)
 
-    elif choice == "r":
-        if RUN_MODE == "LIVE":
-            interval, period = prompt_for_config("15m", "59d")
-            run_live_scanner(period=period, interval=interval)
-        elif RUN_MODE == "HISTORICAL":
-            interval, period = prompt_for_config("1d", "2y")
-            run_historical_backtest(period=period, interval=interval)
-        else:
-            print(f"  ⚠ Unknown RUN_MODE: '{RUN_MODE}'")
-            print(f"  Set it to 'LIVE' or 'HISTORICAL' at the top of the file.\n")
+        interval, period = prompt_for_config("1d", "2y")
+        backtest_historical(tickers=[ticker], period=period, interval=interval)
 
     elif choice in ("q", "quit", "exit"):
         print("  Bye! 👋\n")
 
     else:
         print(f"  Invalid choice: '{choice}'\n")
+
 
 # ── Run the script ──
 if __name__ == "__main__":

@@ -1,142 +1,16 @@
 ======================================================================
-  📊 HISTORICAL BACKTEST RESULTS
+  📊 HISTORICAL BACKTEST RESULTS (v2.0)
 ======================================================================
-  Run Date       : 2026-06-26 14:45:37
-  Data           : Interval: 1d, Period: 2y
-  Tickers scanned: 200
-  Patterns found : 5
+  Run Date       : 2026-06-26 16:24:32
+  Data           : Interval: 1d, Period: 5Y
+  Smoothing      : SMA(5)
+  Tickers scanned: 1
+  Patterns found : 0
   Geometry       : Handle ≤ 32% of cup depth
 ======================================================================
 
-──────────────────────────────────────────────────────────────────────
-  SUMMARY TABLE
-──────────────────────────────────────────────────────────────────────
-
- #        Ticker Left Rim Date  Left Rim Bottom Date  Bottom Right Rim Date  Right Rim Handle Date  Handle Low  Cup Drop %  Handle Dip %
- 1    HYUNDAI.NS    2025-02-07   1879.99  2025-04-07 1568.01     2025-05-21    1891.68  2025-06-03     1804.82       16.59          4.59
- 2        KEI.NS    2025-10-15   4415.37  2025-11-06 3922.96     2025-12-22    4436.35  2025-12-30     4347.35       11.15          2.01
- 3 LAURUSLABS.NS    2026-01-07   1127.38  2026-03-19  943.96     2026-04-17    1134.62  2026-04-28     1089.37       16.27          3.99
- 4      LUPIN.NS    2025-04-28   2092.39  2025-08-06 1851.80     2025-11-14    2055.30  2025-11-24     1999.60       11.50          2.71
- 5        PNB.NS    2025-07-16    111.72  2025-08-29   98.03     2025-10-10     113.93  2025-10-17      110.49       12.26          3.02
-
-──────────────────────────────────────────────────────────────────────
-  DETAILED PATTERN BREAKDOWN
-──────────────────────────────────────────────────────────────────────
-
-  ════════════════════════════════════════════════════════════
-  🏆 PATTERN #1  —  HYUNDAI.NS
-  ════════════════════════════════════════════════════════════
-  Left Rim  (peak before cup)  : ₹1879.99
-  Cup Bottom (lowest point)    : ₹1568.01
-  Right Rim  (recovery peak)   : ₹1891.68
-  Handle Low (small dip after) : ₹1804.82
-  ─────────────────────────────────────────────────
-  Cup Drop     : 16.59%
-  Recovery Gap : 0.62%
-  ─────────────────────────────────────────────────
-  ✦ GEOMETRY CHECK
-    Cup Depth (₹)              : ₹311.98
-    Max Handle Dip Allowed (₹) : ₹99.83  (= 0.32 × ₹311.98)
-    Actual Handle Pullback (₹) : ₹86.86  (4.59%)
-    Status                     : ✅ PASS
-  ─────────────────────────────────────────────────
-  📅 Left Rim Date   : 2025-02-07 00:00:00
-  📅 Cup Bottom Date : 2025-04-07 00:00:00
-  📅 Right Rim Date  : 2025-05-21 00:00:00
-  📅 Handle Low Date : 2025-06-03 00:00:00
-  ════════════════════════════════════════════════════════════
-
-  ════════════════════════════════════════════════════════════
-  🏆 PATTERN #2  —  KEI.NS
-  ════════════════════════════════════════════════════════════
-  Left Rim  (peak before cup)  : ₹4415.37
-  Cup Bottom (lowest point)    : ₹3922.96
-  Right Rim  (recovery peak)   : ₹4436.35
-  Handle Low (small dip after) : ₹4347.35
-  ─────────────────────────────────────────────────
-  Cup Drop     : 11.15%
-  Recovery Gap : 0.48%
-  ─────────────────────────────────────────────────
-  ✦ GEOMETRY CHECK
-    Cup Depth (₹)              : ₹492.42
-    Max Handle Dip Allowed (₹) : ₹157.57  (= 0.32 × ₹492.42)
-    Actual Handle Pullback (₹) : ₹88.99  (2.01%)
-    Status                     : ✅ PASS
-  ─────────────────────────────────────────────────
-  📅 Left Rim Date   : 2025-10-15 00:00:00
-  📅 Cup Bottom Date : 2025-11-06 00:00:00
-  📅 Right Rim Date  : 2025-12-22 00:00:00
-  📅 Handle Low Date : 2025-12-30 00:00:00
-  ════════════════════════════════════════════════════════════
-
-  ════════════════════════════════════════════════════════════
-  🏆 PATTERN #3  —  LAURUSLABS.NS
-  ════════════════════════════════════════════════════════════
-  Left Rim  (peak before cup)  : ₹1127.38
-  Cup Bottom (lowest point)    : ₹943.96
-  Right Rim  (recovery peak)   : ₹1134.62
-  Handle Low (small dip after) : ₹1089.37
-  ─────────────────────────────────────────────────
-  Cup Drop     : 16.27%
-  Recovery Gap : 0.64%
-  ─────────────────────────────────────────────────
-  ✦ GEOMETRY CHECK
-    Cup Depth (₹)              : ₹183.42
-    Max Handle Dip Allowed (₹) : ₹58.69  (= 0.32 × ₹183.42)
-    Actual Handle Pullback (₹) : ₹45.26  (3.99%)
-    Status                     : ✅ PASS
-  ─────────────────────────────────────────────────
-  📅 Left Rim Date   : 2026-01-07 00:00:00
-  📅 Cup Bottom Date : 2026-03-19 00:00:00
-  📅 Right Rim Date  : 2026-04-17 00:00:00
-  📅 Handle Low Date : 2026-04-28 00:00:00
-  ════════════════════════════════════════════════════════════
-
-  ════════════════════════════════════════════════════════════
-  🏆 PATTERN #4  —  LUPIN.NS
-  ════════════════════════════════════════════════════════════
-  Left Rim  (peak before cup)  : ₹2092.39
-  Cup Bottom (lowest point)    : ₹1851.8
-  Right Rim  (recovery peak)   : ₹2055.3
-  Handle Low (small dip after) : ₹1999.6
-  ─────────────────────────────────────────────────
-  Cup Drop     : 11.5%
-  Recovery Gap : 1.77%
-  ─────────────────────────────────────────────────
-  ✦ GEOMETRY CHECK
-    Cup Depth (₹)              : ₹240.59
-    Max Handle Dip Allowed (₹) : ₹76.99  (= 0.32 × ₹240.59)
-    Actual Handle Pullback (₹) : ₹55.7  (2.71%)
-    Status                     : ✅ PASS
-  ─────────────────────────────────────────────────
-  📅 Left Rim Date   : 2025-04-28 00:00:00
-  📅 Cup Bottom Date : 2025-08-06 00:00:00
-  📅 Right Rim Date  : 2025-11-14 00:00:00
-  📅 Handle Low Date : 2025-11-24 00:00:00
-  ════════════════════════════════════════════════════════════
-
-  ════════════════════════════════════════════════════════════
-  🏆 PATTERN #5  —  PNB.NS
-  ════════════════════════════════════════════════════════════
-  Left Rim  (peak before cup)  : ₹111.72
-  Cup Bottom (lowest point)    : ₹98.03
-  Right Rim  (recovery peak)   : ₹113.93
-  Handle Low (small dip after) : ₹110.49
-  ─────────────────────────────────────────────────
-  Cup Drop     : 12.26%
-  Recovery Gap : 1.97%
-  ─────────────────────────────────────────────────
-  ✦ GEOMETRY CHECK
-    Cup Depth (₹)              : ₹13.69
-    Max Handle Dip Allowed (₹) : ₹4.38  (= 0.32 × ₹13.69)
-    Actual Handle Pullback (₹) : ₹3.44  (3.02%)
-    Status                     : ✅ PASS
-  ─────────────────────────────────────────────────
-  📅 Left Rim Date   : 2025-07-16 00:00:00
-  📅 Cup Bottom Date : 2025-08-29 00:00:00
-  📅 Right Rim Date  : 2025-10-10 00:00:00
-  📅 Handle Low Date : 2025-10-17 00:00:00
-  ════════════════════════════════════════════════════════════
+  No patterns found in the historical data.
+  This is normal — cup-and-handle patterns are relatively rare.
 
 ======================================================================
   📊 BACKTEST COMPLETE
