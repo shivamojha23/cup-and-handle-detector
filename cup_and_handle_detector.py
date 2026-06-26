@@ -51,6 +51,7 @@ import os
 import time
 import datetime
 import warnings
+import argparse
 
 # Fix Windows console encoding so emoji and special characters display correctly.
 # Without this, Windows cmd.exe (which uses cp1252) crashes on characters like ☕ or ═.
@@ -132,6 +133,15 @@ MAX_RECOVERY_GAP_PCT = 3
 # Handle geometry: the handle pullback must be ≤ this fraction of cup depth.
 # 0.32 means the handle can retrace at most 32% of the cup's height.
 HANDLE_MAX_RETRACE_RATIO = 0.32
+
+# Minimum number of candles for each side of the cup (left-to-bottom, bottom-to-right).
+MIN_CUP_CANDLES = 10
+
+# Minimum number of candles for the handle pullback phase.
+MIN_HANDLE_CANDLES = 5
+
+# Maximum allowed average deviation (in %) for the right rim peak stability check.
+RIGHT_RIM_STABILITY_PCT = 3.0
 
 
 # ─── LIVE-MODE DEDUPLICATION CACHE ─────────────────────────────────────────
@@ -216,7 +226,7 @@ def get_nifty_list():
 #  2.  FETCH DATA IN BATCHES  — Download candle data from Yahoo Finance
 # =============================================================================
 
-def fetch_batch_data(tickers, period="59d", interval="15m"):
+def fetch_batch_data(tickers, period=None, start=None, end=None, interval="15m"):
     """
     Downloads candle data for many tickers in batches.
 
@@ -225,11 +235,13 @@ def fetch_batch_data(tickers, period="59d", interval="15m"):
     tickers : list[str]
         e.g., ["RELIANCE.NS", "TCS.NS", ...]
     period : str
-        How far back to look. "59d" = last 59 calendar days,
-        "2y" = last 2 years (requires interval="1d").
+        How far back to look.
+    start : str
+        Start date (YYYY-MM-DD).
+    end : str
+        End date (YYYY-MM-DD).
     interval : str
-        Candle size. "15m" = each row is 15 minutes of trading.
-        "1d" = each row is one trading day.
+        Candle size.
 
     Returns
     -------
@@ -262,14 +274,26 @@ def fetch_batch_data(tickers, period="59d", interval="15m"):
         try:
             # Download data for the entire batch at once.
             # group_by="ticker" means the result is organized per stock.
-            data = yf.download(
-                batch_str,
-                period=period,
-                interval=interval,
-                group_by="ticker",
-                progress=False,     # suppress yfinance's own progress bar
-                threads=True,       # use parallel downloads internally
-            )
+            download_kwargs = {
+                "tickers": batch_str,
+                "interval": interval,
+                "group_by": "ticker",
+                "progress": False,
+                "threads": True
+            }
+            if start and end:
+                download_kwargs["start"] = start
+                download_kwargs["end"] = end
+            elif start:
+                download_kwargs["start"] = start
+            elif end:
+                download_kwargs["end"] = end
+            elif period:
+                download_kwargs["period"] = period
+            else:
+                download_kwargs["period"] = "59d"
+
+            data = yf.download(**download_kwargs)
 
             if data.empty:
                 print("empty result.")
@@ -438,6 +462,20 @@ def detect_cup_and_handle(prices, ticker="UNKNOWN", dates=None, interval="15m", 
             cup_bottom_idx = min(troughs_in_cup, key=lambda t: prices[t])
             cup_bottom_price = prices[cup_bottom_idx]
 
+            # ── NEW RULE: Minimum Cup Duration ──
+            # Both sides of the cup must be at least MIN_CUP_CANDLES.
+            cup_left_duration = cup_bottom_idx - left_rim_idx
+            cup_right_duration = right_rim_idx - cup_bottom_idx
+            if cup_left_duration < MIN_CUP_CANDLES or cup_right_duration < MIN_CUP_CANDLES:
+                continue   # a cup side was formed too quickly
+
+            # ── NEW RULE: No Double-Dip ──
+            # The price must not drop below the cup bottom between the bottom and right rim.
+            # (In other words, the recovery must be clean).
+            prices_after_bottom = prices[cup_bottom_idx:right_rim_idx + 1]
+            if len(prices_after_bottom) > 0 and np.min(prices_after_bottom) < cup_bottom_price:
+                continue   # double dip occurred
+
             # ── Step 3b-extra: Cup SYMMETRY check ──
             # The bottom should sit roughly in the middle of the cup,
             # not right next to one of the rims.
@@ -554,12 +592,25 @@ def detect_cup_and_handle(prices, ticker="UNKNOWN", dates=None, interval="15m", 
             # Compute percentage for display purposes.
             handle_pullback_pct = (handle_pullback / right_rim_price) * 100
 
+            # ── NEW RULE: Minimum Handle Duration ──
+            handle_duration = handle_low_idx - right_rim_idx
+            if handle_duration < MIN_HANDLE_CANDLES:
+                continue   # handle formed too quickly (likely just noise)
+
             # ── Rule 5: Time Proportions ──
             # The Cup must take significantly longer to form than the Handle.
             # Cup Width must be >= 3 * Handle Width.
-            handle_width = handle_low_idx - right_rim_idx
-            if handle_width > 0 and cup_width < 3 * handle_width:
+            if handle_duration > 0 and cup_width < 3 * handle_duration:
                 continue
+
+            # ── NEW RULE: Right Rim Stability ──
+            # Prevent single-candle sharp spikes at the right rim.
+            # Check the average price of surrounding candles.
+            rim_window_start = max(0, right_rim_idx - 2)
+            rim_window_end = min(len(prices), right_rim_idx + 3)
+            rim_window_prices = prices[rim_window_start:rim_window_end]
+            if np.mean(rim_window_prices) < right_rim_price * (1 - RIGHT_RIM_STABILITY_PCT / 100):
+                continue  # right rim is too spiky
 
             # ════════════════ CANDIDATE PATTERN ════════════════
             pattern = {
@@ -578,6 +629,10 @@ def detect_cup_and_handle(prices, ticker="UNKNOWN", dates=None, interval="15m", 
                 "cup_bottom_idx":      int(cup_bottom_idx),
                 "right_rim_idx":       int(right_rim_idx),
                 "handle_low_idx":      int(handle_low_idx),
+                "cup_left_duration":   int(cup_left_duration),
+                "cup_right_duration":  int(cup_right_duration),
+                "handle_duration":     int(handle_duration),
+                "double_dip_passed":   True,
             }
 
             # Attach dates if available (for reporting).
@@ -666,6 +721,12 @@ def print_pattern(p, index=1):
     else:
         print(f"    Status                     : ❌ FAIL  "
               f"(₹{p['handle_pullback']} > ₹{p['max_handle_dip']})")
+
+    print(f"  ─────────────────────────────────────────────────")
+    print(f"  ✦ DURATION & VALIDATION CHECK")
+    print(f"    Cup Duration (L→B, B→R)    : {p.get('cup_left_duration', 'N/A')} candles, {p.get('cup_right_duration', 'N/A')} candles")
+    print(f"    Handle Duration            : {p.get('handle_duration', 'N/A')} candles")
+    print(f"    Double-Dip Check           : {'✅ PASSED' if p.get('double_dip_passed') else '❌ FAILED'}")
 
     # Show dates if available.
     if "left_rim_date" in p:
@@ -850,7 +911,7 @@ def test_with_sample_data():
 #  6.  HISTORICAL BACKTEST  — Full-sweep mode (MODE B)
 # =============================================================================
 
-def run_historical_backtest(tickers=None):
+def run_historical_backtest(tickers=None, period="2y", start=None, end=None, interval="1d"):
     """
     MODE B: HISTORICAL BACKTEST
     ===========================
@@ -866,12 +927,12 @@ def run_historical_backtest(tickers=None):
     tickers : list[str] or None
         Specific tickers to scan. If None, fetches the full Nifty watchlist.
     """
-    cfg = MODE_CONFIG["HISTORICAL"]
+    label = f"Interval: {interval}, Period: {period or 'Custom Date Range'}"
 
     print("\n" + "=" * 70)
     print("  📊 HISTORICAL BACKTEST  (Full Timeline Sweep)")
     print("=" * 70)
-    print(f"  Data   : {cfg['label']}")
+    print(f"  Data   : {label}")
     print(f"  Filter : NONE — every valid pattern is printed")
     print(f"  Geometry: Handle ≤ {HANDLE_MAX_RETRACE_RATIO * 100:.0f}% "
           f"of cup depth\n")
@@ -881,11 +942,11 @@ def run_historical_backtest(tickers=None):
         print("  Fetching Nifty watchlist ...\n")
         tickers = get_nifty_list()
 
-    print(f"  Scanning {len(tickers)} tickers over {cfg['label']}\n")
+    print(f"  Scanning {len(tickers)} tickers over {label}\n")
 
     # Download all data in batches.
     all_data = fetch_batch_data(
-        tickers, period=cfg["period"], interval=cfg["interval"]
+        tickers, period=period, start=start, end=end, interval=interval
     )
 
     if not all_data:
@@ -912,7 +973,7 @@ def run_historical_backtest(tickers=None):
         # verbose=False suppresses per-rejection print messages.
         patterns = detect_cup_and_handle(
             close_prices, ticker=ticker, dates=dates,
-            interval=cfg["interval"], highs=high_prices, verbose=False
+            interval=interval, highs=high_prices, verbose=False
         )
 
         if patterns:
@@ -935,7 +996,7 @@ def run_historical_backtest(tickers=None):
         f.write("  📊 HISTORICAL BACKTEST RESULTS\n")
         f.write("=" * 70 + "\n")
         f.write(f"  Run Date       : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"  Data           : {cfg['label']}\n")
+        f.write(f"  Data           : {label}\n")
         f.write(f"  Tickers scanned: {tickers_scanned}\n")
         f.write(f"  Patterns found : {len(all_patterns)}\n")
         f.write(f"  Geometry       : Handle ≤ {HANDLE_MAX_RETRACE_RATIO * 100:.0f}% "
@@ -1130,7 +1191,7 @@ def _is_pattern_from_today(pattern):
         return False
 
 
-def scan_watchlist_live(tickers):
+def scan_watchlist_live(tickers, period=None, start=None, end=None, interval="15m"):
     """
     One-shot live scan: downloads the latest intraday data, runs detection,
     and filters for patterns completing TODAY only.
@@ -1153,14 +1214,12 @@ def scan_watchlist_live(tickers):
     """
     global _live_alerted_today
 
-    cfg = MODE_CONFIG["LIVE"]
-
     # Step 1: Clear the dedup cache if the date rolled over.
     _reset_dedup_cache_if_new_day()
 
     # Step 2: Download latest intraday data.
     all_data = fetch_batch_data(
-        tickers, period=cfg["period"], interval=cfg["interval"]
+        tickers, period=period, start=start, end=end, interval=interval
     )
 
     new_alerts = []
@@ -1180,7 +1239,7 @@ def scan_watchlist_live(tickers):
 
         patterns = detect_cup_and_handle(
             close_prices, ticker=ticker, dates=dates,
-            interval=cfg["interval"], highs=high_prices
+            interval=interval, highs=high_prices
         )
 
         # Step 4: Filter — only keep patterns completing TODAY.
@@ -1195,7 +1254,7 @@ def scan_watchlist_live(tickers):
     return new_alerts
 
 
-def run_live_scanner(tickers=None):
+def run_live_scanner(tickers=None, period="59d", start=None, end=None, interval="15m"):
     """
     MODE A: LIVE SCANNER
     ====================
@@ -1214,12 +1273,12 @@ def run_live_scanner(tickers=None):
     tickers : list[str] or None
         If None, fetches the Nifty watchlist automatically.
     """
-    cfg = MODE_CONFIG["LIVE"]
+    label = f"Interval: {interval}, Period: {period or 'Custom Date Range'}"
 
     print("\n" + "=" * 70)
     print("  🚀 LIVE SCANNER — Current-Day Patterns Only")
     print("=" * 70)
-    print(f"  Data          : {cfg['label']}")
+    print(f"  Data          : {label}")
     print(f"  Scan interval : every {SCAN_INTERVAL_MINUTES} minutes")
     print(f"  Market hours  : Mon–Fri, 9:15 AM – 3:30 PM IST")
     print(f"  Dedup         : Each ticker alerts at most ONCE per day")
@@ -1250,7 +1309,7 @@ def run_live_scanner(tickers=None):
                   f"already alerted today.\n")
 
             try:
-                new_alerts = scan_watchlist_live(tickers)
+                new_alerts = scan_watchlist_live(tickers, period=period, start=start, end=end, interval=interval)
 
                 if new_alerts:
                     print(f"\n  🔔 {len(new_alerts)} NEW ALERT(S)!\n")
@@ -1276,29 +1335,76 @@ def run_live_scanner(tickers=None):
 #  8.  MAIN ENTRY POINT  — Dispatches based on RUN_MODE
 # =============================================================================
 
+def validate_yfinance_params(interval, period):
+    intraday_intervals = ["1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h"]
+    
+    if interval in intraday_intervals:
+        if period:
+            if period.endswith("y") or period.endswith("mo"):
+                print(f"  ⚠ WARNING: yfinance only supports up to 60 days for {interval} intraday data.")
+                print(f"  Capping lookback to '59d'.\n")
+                return "59d"
+            elif period.endswith("d"):
+                try:
+                    days = int(period[:-1])
+                    if days >= 60:
+                        print(f"  ⚠ WARNING: yfinance only supports up to 60 days for {interval} intraday data.")
+                        print(f"  Capping lookback to '59d'.\n")
+                        return "59d"
+                except:
+                    pass
+    return period
+
+def prompt_for_config(default_interval="1d", default_period="2y"):
+    print("\n  [Configuration]")
+    interval = input(f"  Enter candle interval (e.g., 15m, 1h, 1d) [default {default_interval}]: ").strip()
+    if not interval:
+        interval = default_interval
+        
+    if interval in ["1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h"]:
+        if default_period == "2y":
+            default_period = "59d"
+        
+    period = input(f"  Enter lookback period (e.g., 59d, 6mo, 2y) [default {default_period}]: ").strip()
+    if not period:
+        period = default_period
+        
+    period = validate_yfinance_params(interval, period)
+    return interval, period
+
 def main():
     """
-    Entry point. Reads the RUN_MODE variable and dispatches accordingly.
+    Entry point. Reads the RUN_MODE variable and dispatches accordingl3y.
 
     Usage
     -----
     # Toggle at top of file:
-    RUN_MODE = "LIVE_SCAN"     # or "HISTORICAL"
+    RUN_MODE = "LIVE"     # or "HISTORICAL"
 
     # Or override via command-line:
-    python cup_and_handle_detector.py test         → self-test
-    python cup_and_handle_detector.py live         → live scanner (overrides RUN_MODE)
-    python cup_and_handle_detector.py historical   → historical backtest
-    python cup_and_handle_detector.py historical RELIANCE.NS TCS.NS
-                                                   → backtest specific stocks
+    python cup_and_handle_detector.py test
+    python cup_and_handle_detector.py live --interval 15m --lookback 59d
+    python cup_and_handle_detector.py historical RELIANCE.NS TCS.NS --interval 1d --lookback 2y
+    python cup_and_handle_detector.py historical --start-date 2024-01-01 --end-date 2024-06-01
+
     # Or use the interactive menu:
-    python cup_and_handle_detector.py              → menu
+    python cup_and_handle_detector.py
     """
+    parser = argparse.ArgumentParser(description="Cup and Handle Pattern Detector")
+    parser.add_argument("mode", nargs="?", default="", help="test, historical, live, or empty for interactive menu")
+    parser.add_argument("tickers", nargs="*", help="Optional specific tickers to scan in historical mode")
+    parser.add_argument("--interval", "-i", type=str, help="Candle interval (e.g., 15m, 1d)")
+    parser.add_argument("--lookback", "-l", type=str, help="Lookback period (e.g., 59d, 2y)")
+    parser.add_argument("--start-date", "-s", type=str, help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--end-date", "-e", type=str, help="End date (YYYY-MM-DD)")
+    
+    args = parser.parse_args()
+
     print(r"""
     ╔══════════════════════════════════════════════════════════════╗
     ║                                                              ║
     ║     ☕  CUP & HANDLE  PATTERN  DETECTOR                      ║
-    ║         Indian Stock Market (NSE)                             ║
+    ║         Indian Stock Market (NSE)                            ║
     ║                                                              ║
     ║     Geometry : Handle ≤ 32% of Cup Depth                     ║
     ║     Modes    : LIVE       |  HISTORICAL                      ║
@@ -1306,51 +1412,57 @@ def main():
     ╚══════════════════════════════════════════════════════════════╝
     """)
 
-    print(f"  ⚙ Active RUN_MODE = \"{RUN_MODE}\"\n")
+    mode = args.mode.lower()
+    
+    # Process args if provided
+    interval = args.interval
+    period = args.lookback
+    
+    if interval and period:
+        period = validate_yfinance_params(interval, period)
 
-    # ── Command-line argument mode (overrides RUN_MODE) ──
-    if len(sys.argv) > 1:
-        mode = sys.argv[1].lower()
+    if mode == "test":
+        test_with_sample_data()
+        return
 
-        if mode == "test":
-            test_with_sample_data()
-            return
-
-        elif mode in ("historical", "backtest"):
-            # Optional: specific tickers after the mode keyword.
-            if len(sys.argv) > 2:
-                specific_tickers = sys.argv[2:]
-                # Ensure .NS suffix
-                specific_tickers = [
-                    t if t.endswith(".NS") else f"{t}.NS"
-                    for t in specific_tickers
-                ]
-                run_historical_backtest(tickers=specific_tickers)
-            else:
-                run_historical_backtest()
-            return
-
-        elif mode in ("live", "live_scan"):
-            run_live_scanner()
-            return
-
+    elif mode in ("historical", "backtest"):
+        if not interval:
+            interval = "1d"
+        if not period and not args.start_date:
+            period = "2y"
+        
+        period = validate_yfinance_params(interval, period)
+        
+        if args.tickers:
+            specific_tickers = [t if t.endswith(".NS") else f"{t}.NS" for t in args.tickers]
+            run_historical_backtest(tickers=specific_tickers, period=period, start=args.start_date, end=args.end_date, interval=interval)
         else:
-            print(f"  Unknown mode: '{mode}'")
-            print(f"  Valid modes: test, historical, live\n")
-            return
+            run_historical_backtest(period=period, start=args.start_date, end=args.end_date, interval=interval)
+        return
+
+    elif mode in ("live", "live_scan"):
+        if not interval:
+            interval = "15m"
+        if not period and not args.start_date:
+            period = "59d"
+            
+        period = validate_yfinance_params(interval, period)
+        run_live_scanner(period=period, start=args.start_date, end=args.end_date, interval=interval)
+        return
+        
+    elif mode != "":
+        print(f"  Unknown mode: '{mode}'")
+        print(f"  Valid modes: test, historical, live\n")
+        return
 
     # ── Interactive menu ──
+    print(f"  ⚙ Active RUN_MODE = \"{RUN_MODE}\"\n")
     print("  Choose a mode:\n")
-    print("    [1]  🧪 Self-Test         — Run on synthetic data "
-          "(instant, no internet)")
-    print("    [2]  📊 Historical Backtest — Full timeline sweep "
-          f"({MODE_CONFIG['HISTORICAL']['label']})")
-    print("    [3]  🚀 Live Scanner       — Current-day patterns only "
-          f"({MODE_CONFIG['LIVE']['label']})")
-    print("    [4]  📊 Backtest ONE       — Historical scan for a "
-          "specific stock")
-    print(f"    [R]  ▶ Run RUN_MODE       — Execute the configured mode "
-          f"(\"{RUN_MODE}\")")
+    print("    [1]  🧪 Self-Test         — Run on synthetic data (instant, no internet)")
+    print("    [2]  📊 Historical Backtest — Full timeline sweep")
+    print("    [3]  🚀 Live Scanner       — Current-day patterns only")
+    print("    [4]  📊 Backtest ONE       — Historical scan for a specific stock")
+    print(f"    [R]  ▶ Run RUN_MODE       — Execute the configured mode (\"{RUN_MODE}\")")
     print("    [Q]  Exit\n")
 
     choice = input("  Enter choice (1/2/3/4/R/Q): ").strip().lower()
@@ -1359,39 +1471,40 @@ def main():
         test_with_sample_data()
 
     elif choice == "2":
-        run_historical_backtest()
+        interval, period = prompt_for_config("1d", "2y")
+        run_historical_backtest(period=period, interval=interval)
 
     elif choice == "3":
-        run_live_scanner()
+        interval, period = prompt_for_config("15m", "59d")
+        run_live_scanner(period=period, interval=interval)
 
     elif choice == "4":
-        ticker = input(
-            "  Enter ticker (e.g., RELIANCE or RELIANCE.NS): "
-        ).strip()
+        ticker = input("  Enter ticker (e.g., RELIANCE or RELIANCE.NS): ").strip()
         if not ticker:
             print("  No ticker entered. Exiting.\n")
             return
         if not ticker.endswith(".NS"):
             ticker += ".NS"
-        run_historical_backtest(tickers=[ticker])
+            
+        interval, period = prompt_for_config("1d", "2y")
+        run_historical_backtest(tickers=[ticker], period=period, interval=interval)
 
     elif choice == "r":
-        # Dispatch based on the RUN_MODE variable set at the top.
         if RUN_MODE == "LIVE":
-            run_live_scanner()
+            interval, period = prompt_for_config("15m", "59d")
+            run_live_scanner(period=period, interval=interval)
         elif RUN_MODE == "HISTORICAL":
-            run_historical_backtest()
+            interval, period = prompt_for_config("1d", "2y")
+            run_historical_backtest(period=period, interval=interval)
         else:
             print(f"  ⚠ Unknown RUN_MODE: '{RUN_MODE}'")
-            print(f"  Set it to 'LIVE' or 'HISTORICAL' at the top "
-                  f"of the file.\n")
+            print(f"  Set it to 'LIVE' or 'HISTORICAL' at the top of the file.\n")
 
     elif choice in ("q", "quit", "exit"):
         print("  Bye! 👋\n")
 
     else:
         print(f"  Invalid choice: '{choice}'\n")
-
 
 # ── Run the script ──
 if __name__ == "__main__":
